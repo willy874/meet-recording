@@ -1,5 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
-import './App.css'
+import {
+  AppBar, Toolbar, Typography, Container, Box, Stack, Card, CardContent,
+  Button, IconButton, TextField, MenuItem, Select, FormControlLabel, Checkbox,
+  Tabs, Tab, Chip, List, ListItem, ListItemButton, ListItemText, LinearProgress,
+  Alert, Tooltip, InputLabel, FormControl, useColorScheme, Divider,
+} from '@mui/material'
+import AddIcon from '@mui/icons-material/Add'
+import RefreshIcon from '@mui/icons-material/Refresh'
+import PauseIcon from '@mui/icons-material/Pause'
+import PlayArrowIcon from '@mui/icons-material/PlayArrow'
+import StopIcon from '@mui/icons-material/Stop'
+import ContentCopyIcon from '@mui/icons-material/ContentCopy'
+import DownloadIcon from '@mui/icons-material/Download'
+import VideocamIcon from '@mui/icons-material/Videocam'
+import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
+import LightModeIcon from '@mui/icons-material/LightMode'
+import DarkModeIcon from '@mui/icons-material/DarkMode'
+import SettingsBrightnessIcon from '@mui/icons-material/SettingsBrightness'
+import { statusColor } from './theme'
 
 type Segment = { start: number; end: number; text: string }
 type Info = { language: string; language_probability: number; duration: number }
@@ -27,14 +45,10 @@ const formatDuration = (s: number) => {
   return `${h}h ${m % 60}m`
 }
 
-const STATUS_COLOR: Record<JobStatus, string> = {
-  queued: '#888', running: '#0a84ff', paused: '#f59e0b',
-  done: '#10b981', error: '#ef4444', cancelled: '#6b7280',
-}
-
 export default function App() {
   const [jobs, setJobs] = useState<JobSummary[]>([])
   const [selected, setSelected] = useState<string | null>(null)
+  const [outputsDir, setOutputsDir] = useState<string | null>(null)
 
   const refreshJobs = async () => {
     try {
@@ -45,65 +59,209 @@ export default function App() {
     } catch { /* ignore */ }
   }
 
+  const refreshOutputsDir = async () => {
+    try {
+      const r = await fetch('/api/outputs-dir')
+      const data = await r.json()
+      setOutputsDir(data.outputs_dir ?? null)
+    } catch { /* ignore */ }
+  }
+
   useEffect(() => {
     refreshJobs()
+    refreshOutputsDir()
     const t = setInterval(refreshJobs, 2000)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
-    <div className="container">
-      <h1>Meet · 逐字稿</h1>
-      <div className="layout">
-        <Sidebar jobs={jobs} selected={selected} onSelect={setSelected} onRefresh={refreshJobs} />
-        <main className="detail">
-          {selected
-            ? <JobDetail key={selected} jobId={selected} onChange={refreshJobs} />
-            : <NewJob onCreated={(id) => { refreshJobs(); setSelected(id) }} />}
-        </main>
-      </div>
-    </div>
+    <Box sx={{ minHeight: '100vh', bgcolor: 'background.default' }}>
+      <AppBar
+        position="sticky"
+        elevation={0}
+        color="transparent"
+        sx={{ backdropFilter: 'blur(12px)', borderBottom: 1, borderColor: 'divider' }}
+      >
+        <Toolbar>
+          <Typography variant="h5" sx={{ flex: 1, fontWeight: 500 }}>
+            Meet · 逐字稿
+          </Typography>
+          <ColorSchemeToggle />
+        </Toolbar>
+      </AppBar>
+
+      <Container maxWidth="lg" sx={{ pt: 2 }}>
+        <OutputsDirBar value={outputsDir} onChange={setOutputsDir} />
+      </Container>
+
+      <Container maxWidth="lg" sx={{ py: 4 }}>
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: { xs: '1fr', md: '300px 1fr' },
+            gap: 3,
+            alignItems: 'start',
+          }}
+        >
+          <Sidebar jobs={jobs} selected={selected} onSelect={setSelected} onRefresh={refreshJobs} />
+          <Box>
+            {selected
+              ? <JobDetail key={selected} jobId={selected} onChange={refreshJobs} />
+              : <NewJob onCreated={(id) => { refreshJobs(); setSelected(id) }} />}
+          </Box>
+        </Box>
+      </Container>
+    </Box>
   )
 }
 
+function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const startEdit = () => { setDraft(value ?? ''); setError(null); setEditing(true) }
+  const cancel = () => { setEditing(false); setError(null) }
+
+  const save = async () => {
+    const path = draft.trim()
+    if (!path) return
+    setSaving(true); setError(null)
+    try {
+      const r = await fetch('/api/outputs-dir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      onChange(data.outputs_dir as string)
+      setEditing(false)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card variant="outlined" sx={{ mb: 0 }}>
+      <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ alignItems: { sm: 'center' } }}>
+          <Typography variant="body2" color="text.secondary" sx={{ flexShrink: 0 }}>
+            輸出資料夾
+          </Typography>
+          {editing ? (
+            <>
+              <TextField
+                size="small"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder="/絕對路徑/到/輸出資料夾"
+                fullWidth
+                disabled={saving}
+                slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } } }}
+                onKeyDown={(e) => { if (e.key === 'Enter') save() }}
+              />
+              <Stack direction="row" spacing={1}>
+                <Button size="small" variant="contained" onClick={save} disabled={saving || !draft.trim()}>儲存</Button>
+                <Button size="small" onClick={cancel} disabled={saving}>取消</Button>
+              </Stack>
+            </>
+          ) : (
+            <>
+              <Typography
+                variant="body2"
+                sx={{ flex: 1, fontFamily: 'ui-monospace, monospace', fontSize: 13, wordBreak: 'break-all' }}
+              >
+                {value || '（載入中…）'}
+              </Typography>
+              <Button size="small" onClick={startEdit} disabled={!value}>變更</Button>
+            </>
+          )}
+        </Stack>
+        {error && <Alert severity="error" sx={{ mt: 1 }}>{error}</Alert>}
+      </CardContent>
+    </Card>
+  )
+}
+
+function ColorSchemeToggle() {
+  const { mode, setMode } = useColorScheme()
+  if (!mode) return null
+  const next = mode === 'light' ? 'dark' : mode === 'dark' ? 'system' : 'light'
+  const Icon = mode === 'light' ? LightModeIcon : mode === 'dark' ? DarkModeIcon : SettingsBrightnessIcon
+  return (
+    <Tooltip title={`配色：${mode}（點擊切換）`}>
+      <IconButton onClick={() => setMode(next)}><Icon /></IconButton>
+    </Tooltip>
+  )
+}
 
 function Sidebar({ jobs, selected, onSelect, onRefresh }: {
   jobs: JobSummary[]; selected: string | null;
   onSelect: (id: string | null) => void; onRefresh: () => void;
 }) {
   return (
-    <aside className="sidebar">
-      <div className="sidebar-head">
-        <button onClick={() => onSelect(null)}>+ 新轉錄</button>
-        <button className="ghost" onClick={onRefresh}>↻</button>
-      </div>
-      <div className="job-list">
-        {jobs.length === 0 && <div className="empty">尚無任務</div>}
-        {jobs.map((j) => (
-          <button
-            key={j.id}
-            className={'job-item' + (j.id === selected ? ' selected' : '')}
-            onClick={() => onSelect(j.id)}
+    <Card sx={{ position: { md: 'sticky' }, top: { md: 88 } }}>
+      <CardContent>
+        <Stack direction="row" spacing={1} sx={{ mb: 1.5 }}>
+          <Button
+            startIcon={<AddIcon />}
+            variant="contained"
+            sx={{ flex: 1 }}
+            onClick={() => onSelect(null)}
           >
-            <div className="job-row">
-              <span className="status-dot" style={{ background: STATUS_COLOR[j.status] }} />
-              <span className="job-name">{j.filename}</span>
-            </div>
-            <div className="job-meta">
-              <span>{j.status}</span>
-              <span>·</span>
-              <span>{(j.progress * 100).toFixed(0)}%</span>
-              <span>·</span>
-              <span>{j.segment_count} 段</span>
-            </div>
-          </button>
-        ))}
-      </div>
-    </aside>
+            新轉錄
+          </Button>
+          <Tooltip title="重新整理">
+            <IconButton onClick={onRefresh}><RefreshIcon /></IconButton>
+          </Tooltip>
+        </Stack>
+        <Divider sx={{ mb: 1 }} />
+        <List dense disablePadding sx={{ maxHeight: '70vh', overflowY: 'auto' }}>
+          {jobs.length === 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 4 }}>
+              尚無任務
+            </Typography>
+          )}
+          {jobs.map((j) => (
+            <ListItem key={j.id} disablePadding sx={{ mb: 0.5 }}>
+              <ListItemButton
+                selected={j.id === selected}
+                onClick={() => onSelect(j.id)}
+                sx={{ alignItems: 'flex-start', py: 1, px: 1.5 }}
+              >
+                <FiberManualRecordIcon
+                  color={statusColor(j.status) as 'primary' | 'success' | 'error' | 'warning' | 'inherit'}
+                  sx={{ fontSize: 10, mt: '8px', mr: 1 }}
+                />
+                <ListItemText
+                  primary={j.filename}
+                  secondary={
+                    <Box component="span" sx={{ display: 'flex', gap: 0.75, fontSize: 11 }}>
+                      <span>{j.status}</span>
+                      <span>·</span>
+                      <span>{(j.progress * 100).toFixed(0)}%</span>
+                      <span>·</span>
+                      <span>{j.segment_count} 段</span>
+                    </Box>
+                  }
+                  slotProps={{
+                    primary: { noWrap: true, variant: 'body2', sx: { fontWeight: 500 } },
+                    secondary: { component: 'span' },
+                  }}
+                />
+              </ListItemButton>
+            </ListItem>
+          ))}
+        </List>
+      </CardContent>
+    </Card>
   )
 }
-
 
 function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
   const [mode, setMode] = useState<'file' | 'live'>('file')
@@ -161,94 +319,132 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
   }
 
   return (
-    <div className="card">
-      <h2>新轉錄任務</h2>
-      <div className="row tabs">
-        <button className={mode === 'file' ? 'tab active' : 'tab'} onClick={() => setMode('file')}>檔案上傳</button>
-        <button className={mode === 'live' ? 'tab active' : 'tab'} onClick={() => setMode('live')}>OBS 直播</button>
-      </div>
+    <Card>
+      <CardContent>
+        <Typography variant="h5" sx={{ mb: 2 }}>新轉錄任務</Typography>
 
-      {mode === 'file' ? (
-        <div className="row">
-          <input type="file" accept="audio/*,video/*" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-        </div>
-      ) : (
-        <>
-          <div className="row">
-            <label style={{ flex: 1 }}>監聽 URL：
-              <input
-                type="text"
-                value={listenUrl}
-                onChange={(e) => setListenUrl(e.target.value)}
-                style={{ width: '100%', fontFamily: 'monospace' }}
-              />
-            </label>
-          </div>
-          <div className="row">
-            <label>標籤（可選）：
-              <input type="text" value={label} placeholder="OBS Live"
-                     onChange={(e) => setLabel(e.target.value)} />
-            </label>
-            <label>chunk 秒數：
-              <input type="number" min={2} max={30} value={chunkSeconds}
-                     onChange={(e) => setChunkSeconds(Number(e.target.value) || 6)}
-                     style={{ width: 60 }} />
-            </label>
-          </div>
-          <div className="row">
-            <label>
-              <input type="checkbox" checked={record}
-                     onChange={(e) => setRecord(e.target.checked)} />
-              同步保留影片檔（不重編，存到 outputs/）
-            </label>
-            {record && (
-              <label>格式：
-                <select value={recordFormat} onChange={(e) => setRecordFormat(e.target.value as 'mkv' | 'mp4' | 'ts')}>
-                  <option value="mkv">mkv（推薦，串流斷掉也不會壞）</option>
-                  <option value="mp4">mp4</option>
-                  <option value="ts">ts</option>
-                </select>
-              </label>
-            )}
-          </div>
-          <div className="meta">
-            <strong>meet 端</strong>：上面的 URL 必須帶 <code>?listen=1</code>（tcp/udp 自動補；srt 用 <code>?mode=listener</code>）。<br />
-            <strong>OBS 端</strong>：設定 → 輸出 → 模式：進階 → 錄製 → 類型：<strong>自訂輸出 (FFmpeg)</strong> →
-            FFmpeg 輸出類型：<strong>輸出到 URL</strong> → URL 填 <code>tcp://127.0.0.1:9999</code>
-            （<em>不要</em>加 <code>?listen=1</code>，OBS 是去 connect），容器格式選 <code>mpegts</code>。<br />
-            順序：先在這裡按「開始監聽」，再去 OBS 開始錄製。
-          </div>
-        </>
-      )}
+        <Tabs
+          value={mode}
+          onChange={(_, v) => setMode(v)}
+          sx={{ mb: 3, '& .MuiTabs-indicator': { height: 3, borderRadius: 3 } }}
+        >
+          <Tab value="file" label="檔案上傳" />
+          <Tab value="live" label="OBS 直播" />
+        </Tabs>
 
-      <div className="row">
-        <label>語言：
-          <select value={language} onChange={(e) => setLanguage(e.target.value)}>
-            <option value="zh-TW">繁體中文</option>
-            <option value="zh-CN">简体中文</option>
-            <option value="en">English</option>
-            <option value="ja">日本語</option>
-            <option value="ko">한국어</option>
-            <option value="auto">自動偵測</option>
-          </select>
-        </label>
-        <label>
-          <input type="checkbox" checked={vad} onChange={(e) => setVad(e.target.checked)} />
-          VAD（過濾靜音）
-        </label>
-      </div>
-      <div className="row">
         {mode === 'file' ? (
-          <button onClick={handleStartFile} disabled={!file || submitting}>開始轉錄</button>
+          <Box sx={{ mb: 2 }}>
+            <Button variant="outlined" component="label">
+              {file ? file.name : '選擇音訊／影片檔'}
+              <input
+                hidden
+                type="file"
+                accept="audio/*,video/*"
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              />
+            </Button>
+          </Box>
         ) : (
-          <button onClick={handleStartLive} disabled={!listenUrl || submitting}>開始監聽</button>
+          <Stack spacing={2} sx={{ mb: 2 }}>
+            <TextField
+              label="監聽 URL"
+              value={listenUrl}
+              onChange={(e) => setListenUrl(e.target.value)}
+              fullWidth
+              slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace' } } }}
+            />
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                label="標籤（可選）"
+                placeholder="OBS Live"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                sx={{ flex: 1 }}
+              />
+              <TextField
+                label="chunk 秒數"
+                type="number"
+                value={chunkSeconds}
+                onChange={(e) => setChunkSeconds(Number(e.target.value) || 6)}
+                slotProps={{ htmlInput: { min: 2, max: 30 } }}
+                sx={{ width: 140 }}
+              />
+            </Stack>
+            <FormControlLabel
+              control={
+                <Checkbox checked={record} onChange={(e) => setRecord(e.target.checked)} />
+              }
+              label="同步保留影片檔（不重編，存到 outputs/）"
+            />
+            {record && (
+              <FormControl size="small" sx={{ maxWidth: 320 }}>
+                <InputLabel>格式</InputLabel>
+                <Select
+                  label="格式"
+                  value={recordFormat}
+                  onChange={(e) => setRecordFormat(e.target.value as 'mkv' | 'mp4' | 'ts')}
+                >
+                  <MenuItem value="mkv">mkv（推薦，串流斷掉也不會壞）</MenuItem>
+                  <MenuItem value="mp4">mp4</MenuItem>
+                  <MenuItem value="ts">ts</MenuItem>
+                </Select>
+              </FormControl>
+            )}
+            <Alert severity="info" variant="outlined">
+              <Typography variant="body2" component="div">
+                <strong>meet 端</strong>：URL 需帶 <code>?listen=1</code>（tcp/udp 自動補；srt 用 <code>?mode=listener</code>）。<br />
+                <strong>OBS 端</strong>：設定 → 輸出 → 模式：進階 → 錄製 → 類型：<strong>自訂輸出 (FFmpeg)</strong> →
+                FFmpeg 輸出類型：<strong>輸出到 URL</strong> → URL 填 <code>tcp://127.0.0.1:9999</code>
+                （<em>不要</em>加 <code>?listen=1</code>），容器格式選 <code>mpegts</code>。<br />
+                順序：先在這裡按「開始監聽」，再去 OBS 開始錄製。
+              </Typography>
+            </Alert>
+          </Stack>
         )}
-      </div>
-      {error && <div className="error">錯誤：{error}</div>}
-    </div>
+
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ mb: 3 }}>
+          <FormControl size="small" sx={{ minWidth: 180 }}>
+            <InputLabel>語言</InputLabel>
+            <Select label="語言" value={language} onChange={(e) => setLanguage(e.target.value)}>
+              <MenuItem value="zh-TW">繁體中文</MenuItem>
+              <MenuItem value="zh-CN">简体中文</MenuItem>
+              <MenuItem value="en">English</MenuItem>
+              <MenuItem value="ja">日本語</MenuItem>
+              <MenuItem value="ko">한국어</MenuItem>
+              <MenuItem value="auto">自動偵測</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControlLabel
+            control={<Checkbox checked={vad} onChange={(e) => setVad(e.target.checked)} />}
+            label="VAD（過濾靜音）"
+          />
+        </Stack>
+
+        {mode === 'file' ? (
+          <Button
+            variant="contained"
+            onClick={handleStartFile}
+            disabled={!file || submitting}
+            startIcon={<PlayArrowIcon />}
+          >
+            開始轉錄
+          </Button>
+        ) : (
+          <Button
+            variant="contained"
+            onClick={handleStartLive}
+            disabled={!listenUrl || submitting}
+            startIcon={<VideocamIcon />}
+          >
+            開始監聽
+          </Button>
+        )}
+
+        {error && <Alert severity="error" sx={{ mt: 2 }}>錯誤：{error}</Alert>}
+      </CardContent>
+    </Card>
   )
 }
-
 
 function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void }) {
   const [estimate, setEstimate] = useState<Estimate | null>(null)
@@ -336,69 +532,131 @@ function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void })
   const isActive = status === 'running' || status === 'paused'
 
   return (
-    <>
-      <div className="card">
-        <div className="row job-header">
-          <div>
-            <div className="job-title">{filename}</div>
-            <div className="job-id">job: {jobId}</div>
-          </div>
-          <div className="status-pill" style={{ background: STATUS_COLOR[status] }}>{status}</div>
-        </div>
-        <div className="row">
-          {!live && status === 'running' && <button onClick={() => action('pause')}>⏸ 暫停</button>}
-          {!live && status === 'paused' && <button onClick={() => action('resume')}>▶ 繼續</button>}
-          {isActive && (
-            <button className="danger" onClick={() => action('cancel')}>
-              {live ? '⏹ 停止監聽' : '⏹ 終止'}
-            </button>
-          )}
-          <button onClick={handleCopy} disabled={!segments.length}>複製全文</button>
-          <a href={`/api/jobs/${jobId}/output`} download>
-            <button disabled={status !== 'done' && segments.length === 0}>下載 .txt</button>
-          </a>
-          {recordPath && (
-            <a href={`/api/jobs/${jobId}/recording`} download>
-              <button disabled={isActive}>下載錄影</button>
-            </a>
-          )}
-        </div>
-      </div>
+    <Stack spacing={2}>
+      <Card>
+        <CardContent>
+          <Stack direction="row" spacing={2} sx={{ mb: 2, alignItems: 'flex-start', justifyContent: 'space-between' }}>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="h6" noWrap>{filename}</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'ui-monospace, monospace' }}>
+                job: {jobId}
+              </Typography>
+            </Box>
+            <Chip
+              label={status}
+              color={statusColor(status) as 'primary' | 'success' | 'error' | 'warning' | 'default'}
+              sx={{ textTransform: 'uppercase', fontSize: 11 }}
+              size="small"
+            />
+          </Stack>
 
-      {error && <div className="card error">錯誤：{error}</div>}
+          {isActive && estimate && (
+            <LinearProgress
+              variant="determinate"
+              value={progress * 100}
+              sx={{ height: 6, borderRadius: 3, mb: 2 }}
+            />
+          )}
+
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+            {!live && status === 'running' && (
+              <Button startIcon={<PauseIcon />} onClick={() => action('pause')}>暫停</Button>
+            )}
+            {!live && status === 'paused' && (
+              <Button startIcon={<PlayArrowIcon />} onClick={() => action('resume')}>繼續</Button>
+            )}
+            {isActive && (
+              <Button color="error" variant="contained" startIcon={<StopIcon />} onClick={() => action('cancel')}>
+                {live ? '停止監聽' : '終止'}
+              </Button>
+            )}
+            <Button startIcon={<ContentCopyIcon />} onClick={handleCopy} disabled={!segments.length}>
+              複製全文
+            </Button>
+            <Button
+              component="a"
+              href={`/api/jobs/${jobId}/output`}
+              download
+              startIcon={<DownloadIcon />}
+              disabled={status !== 'done' && segments.length === 0}
+            >
+              下載 .md
+            </Button>
+            {recordPath && (
+              <Button
+                component="a"
+                href={`/api/jobs/${jobId}/recording`}
+                download
+                startIcon={<DownloadIcon />}
+                disabled={isActive}
+              >
+                下載錄影
+              </Button>
+            )}
+          </Stack>
+        </CardContent>
+      </Card>
+
+      {error && <Alert severity="error">錯誤：{error}</Alert>}
+
       {live && (
-        <div className="card meta">
-          🔴 直播模式 · 監聽：<code>{listenUrl}</code>
-          {listening
-            ? '（已就緒，等待 OBS 連入或音訊…）'
-            : '（啟動中，模型載入後會開始監聽）'}
-          {recordPath && <div>🎬 同步錄影：<code>{recordPath}</code></div>}
-        </div>
+        <Alert severity="info" icon={<VideocamIcon />}>
+          🔴 直播模式 · 監聽：<code>{listenUrl}</code>{' '}
+          {listening ? '（已就緒，等待 OBS 連入或音訊…）' : '（啟動中，模型載入後會開始監聽）'}
+          {recordPath && <Box sx={{ mt: 0.5 }}>🎬 同步錄影：<code>{recordPath}</code></Box>}
+        </Alert>
       )}
       {estimate && !info && (
-        <div className="card meta">
+        <Alert severity="info" variant="outlined">
           音檔長度：{formatDuration(estimate.duration_seconds)} · 預估處理時間：~{formatDuration(estimate.eta_seconds)}
           （{estimate.model} / {estimate.device} / {estimate.compute}）
-        </div>
+        </Alert>
       )}
       {info && (
-        <div className="card meta">
+        <Alert severity="success" variant="outlined">
           語言：{info.language}（{(info.language_probability * 100).toFixed(0)}%） · 時長：{formatDuration(info.duration)} · 段落：{segments.length}
           {estimate && isActive && ` · 進度：${(progress * 100).toFixed(0)}% · 剩餘：~${formatDuration(remainingEta)}`}
-        </div>
+        </Alert>
       )}
 
-      <div className="card transcript" ref={transcriptRef} onScroll={handleScroll}>
-        {segments.length === 0 && <div className="empty">尚無內容</div>}
-        {segments.map((s, i) => (
-          <div key={i} className="segment">
-            <span className="ts">[{formatTs(s.start)}]</span>
-            <span className="text">{s.text}</span>
-          </div>
-        ))}
-        {status === 'paused' && <div className="loading">已暫停</div>}
-        {status === 'running' && <div className="loading">轉錄中…</div>}
-      </div>
-    </>
+      <Card>
+        <Box
+          ref={transcriptRef}
+          onScroll={handleScroll}
+          sx={{
+            p: 2,
+            minHeight: 240,
+            maxHeight: '60vh',
+            overflowY: 'auto',
+            fontSize: 15,
+            lineHeight: 1.8,
+          }}
+        >
+          {segments.length === 0 && (
+            <Typography color="text.secondary" sx={{ textAlign: 'center', py: 5 }}>
+              尚無內容
+            </Typography>
+          )}
+          {segments.map((s, i) => (
+            <Stack key={i} direction="row" spacing={1.5} sx={{ py: 0.5 }}>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ fontFamily: 'ui-monospace, monospace', mt: '4px', flexShrink: 0 }}
+              >
+                [{formatTs(s.start)}]
+              </Typography>
+              <Typography sx={{ flex: 1 }}>{s.text}</Typography>
+            </Stack>
+          ))}
+          {status === 'paused' && (
+            <Typography color="text.secondary" sx={{ pt: 1, fontStyle: 'italic' }}>已暫停</Typography>
+          )}
+          {status === 'running' && (
+            <Typography color="text.secondary" sx={{ pt: 1, fontStyle: 'italic' }}>轉錄中…</Typography>
+          )}
+        </Box>
+      </Card>
+    </Stack>
   )
 }

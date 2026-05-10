@@ -51,6 +51,16 @@ def health_ok(host: str, port: int) -> bool:
         return False
 
 
+def fetch_outputs_dir(host: str, port: int) -> Optional[str]:
+    try:
+        r = httpx.get(f"{base_url(host, port)}/api/health", timeout=1.5)
+        if r.status_code == 200:
+            return r.json().get("outputs_dir")
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
+
+
 def kill_group(p: Optional[subprocess.Popen], timeout: float = 5) -> None:
     if not p or p.poll() is not None:
         return
@@ -340,11 +350,12 @@ def run_serve(args, host: str, port: int) -> int:
         return rc
 
     web_url = f"http://localhost:{args.web_port}" if args.web else None
+    effective_outputs = args.outputs_dir or (Path(p) if (p := fetch_outputs_dir(host, port)) else None)
     if args.json:
         print(json.dumps({
             "type": "ready",
             "backend": base_url(host, port),
-            "outputs_dir": str(args.outputs_dir) if args.outputs_dir else None,
+            "outputs_dir": str(effective_outputs) if effective_outputs else None,
             "web": web_url,
         }), flush=True)
     else:
@@ -352,7 +363,7 @@ def run_serve(args, host: str, port: int) -> int:
             console,
             backend=base_url(host, port),
             web=web_url,
-            outputs_dir=args.outputs_dir,
+            outputs_dir=effective_outputs,
             extra_lines=["serve mode — Ctrl-C to stop"],
         )
 
@@ -541,7 +552,11 @@ def run_human(args, host: str, port: int) -> int:
 
     # Mirror backend's authoritative output file to user's -o (if provided and not already streamed)
     if args.output and not state.get("status") == "cancelled":
-        backend_out = BACKEND_DIR.parent / "outputs" / f"{job_id}.txt"
+        try:
+            j = httpx.get(f"{base_url(host, port)}/api/jobs/{job_id}", timeout=5).json()
+            backend_out = Path(j.get("output_path") or "")
+        except (httpx.HTTPError, ValueError):
+            backend_out = Path("")
         if backend_out.exists() and not Path(args.output).exists():
             shutil.copy(backend_out, args.output)
 

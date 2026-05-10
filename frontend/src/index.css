@@ -1,1 +1,8 @@
-/* base styles handled by App.css */
+html, body, #root { height: 100%; }
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--mui-palette-action-hover);
+}
