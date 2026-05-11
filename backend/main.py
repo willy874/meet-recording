@@ -99,25 +99,30 @@ def set_outputs_dir(path: Path) -> Path:
     return resolved
 
 
-def reserve_output_path(ext: str) -> Path:
-    """Return a fresh `{YYYYMMDDHHmmss}-{idx}.{ext}` path inside the current outputs dir.
+def reserve_job_dir() -> Path:
+    """Reserve and create a fresh `{YYYYMMDDHHmmss}-{idx}/` directory inside outputs.
 
     Reservations are tracked in-memory so two jobs created in the same second
-    don't collide before either has actually opened its file.
+    don't collide before either has written its first file.
     """
-    ext = ext.lstrip(".").lower() or "md"
     while True:
         ts = time.strftime("%Y%m%d%H%M%S")
         outputs = get_outputs_dir()
         with _OUTPUTS_LOCK:
             idx = 1
             while True:
-                name = f"{ts}-{idx}.{ext}"
+                name = f"{ts}-{idx}"
                 path = outputs / name
                 if name not in _RESERVED_NAMES and not path.exists():
                     _RESERVED_NAMES.add(name)
+                    path.mkdir(parents=True, exist_ok=True)
                     return path
                 idx += 1
+
+
+def job_file(job_dir: Path, type_: str, ext: str) -> Path:
+    """`{job_dir}/{type}.{ext}` — caller picks the type name (transcript, recording, ...)."""
+    return job_dir / f"{type_}.{ext.lstrip('.').lower() or 'bin'}"
 
 app = FastAPI(title="Meet Transcribe")
 app.add_middleware(
@@ -398,11 +403,12 @@ async def create_job(
         await file.close()
 
     job_id = uuid.uuid4().hex[:12]
+    job_dir = reserve_job_dir()
     job = Job(
         id=job_id,
         filename=file.filename,
         file_path=tmp.name,
-        output_path=str(reserve_output_path("md")),
+        output_path=str(job_file(job_dir, "transcript", "md")),
         language=language,
         vad=vad,
         beam_size=beam_size,
@@ -439,17 +445,18 @@ async def create_live_job(
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
     job_id = uuid.uuid4().hex[:12]
+    job_dir = reserve_job_dir()
     record_path: Optional[str] = None
     if record:
         ext = (record_format or "mkv").lstrip(".").lower()
         if ext not in {"mkv", "mp4", "ts", "flv", "mov"}:
             ext = "mkv"
-        record_path = str(reserve_output_path(ext))
+        record_path = str(job_file(job_dir, "recording", ext))
     job = Job(
         id=job_id,
         filename=label or f"OBS Live · {listen_url}",
         file_path="",
-        output_path=str(reserve_output_path("md")),
+        output_path=str(job_file(job_dir, "transcript", "md")),
         language=language,
         vad=vad,
         beam_size=beam_size,
