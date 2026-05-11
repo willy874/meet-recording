@@ -78,7 +78,22 @@ Examples:
 - `2026-04-21_產品會議_iFrame推版前對齊_v1.docx`
 - `2026-04-21_定錨會議_跨境交通平台_v1.docx`
 
-Save to `/mnt/user-data/outputs/` and present via `present_files`.
+**Output location**:
+
+- If the caller (e.g. another skill or the user) provided an explicit
+  `output_dir` / `outputDir` argument, save the `.docx` there and **skip**
+  `present_files`. After writing, run `ls -la "$output_dir"` (Bash) so the
+  caller can verify the artifact landed. Do NOT also drop a copy in
+  `/mnt/user-data/outputs/`.
+- If no explicit directory is given and `/mnt/user-data/outputs/` exists
+  and is writable, save there and present via `present_files` (the
+  Claude.ai sandbox default).
+- Otherwise (e.g. running on a local CLI without that sandbox path), save
+  to the current working directory and tell the user the absolute path —
+  do not silently fail.
+
+When the caller-provided directory already contains a file with the same
+filename, bump `vN` (`_v1` → `_v2`, etc.) instead of overwriting.
 
 ### Step 7 — Meeting ID
 
@@ -127,6 +142,6 @@ Filename:    YYYY-MM-DD_項目_對象_vN.docx
 Colors:      #F37021 (orange) · #14365C (navy)
 Font:        Microsoft JhengHei
 Structure:   封面 → 目標 → 現況 → 討論 → 決議 → 待辦 → 下次會議 → 名詞
-Output:      /mnt/user-data/outputs/
+Output:      caller-provided output_dir → else /mnt/user-data/outputs/ → else cwd
 Format:      .docx (default)
 ```
