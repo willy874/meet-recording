@@ -1,0 +1,7 @@
+{
+  "name": "recoding-meet",
+  "version": "1.0.0",
+  "description": "把音訊／影片轉成逐字稿，或讓 OBS 推串流進來做**即時轉錄**。前端用瀏覽器看段落即時跳出來，CLI 提供一鍵啟動與機器可讀模式。",
+  "author": "Willy",
+  "license": "ISC"
+}
