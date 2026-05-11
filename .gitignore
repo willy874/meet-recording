@@ -28,8 +28,6 @@ frontend/.vite/
 # Claude local config (per-user, do not commit)
 .claude/settings.local.json
 
-# Project data — keep folders, ignore generated content
-inputs/*
-!inputs/placeholder.txt
-outputs/*
-!outputs/placeholder.txt
+# Project data — never commit user audio or generated transcripts
+inputs/
+outputs/
