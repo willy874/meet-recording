@@ -3,7 +3,7 @@ import {
   AppBar, Toolbar, Typography, Container, Box, Stack, Card, CardContent,
   Button, IconButton, TextField, MenuItem, Select, FormControlLabel, Checkbox,
   Tabs, Tab, Chip, List, ListItem, ListItemButton, ListItemText, LinearProgress,
-  Alert, Tooltip, InputLabel, FormControl, useColorScheme, Divider,
+  Alert, Tooltip, InputLabel, FormControl, useColorScheme, Divider, Snackbar,
 } from '@mui/material'
 import AddIcon from '@mui/icons-material/Add'
 import RefreshIcon from '@mui/icons-material/Refresh'
@@ -49,6 +49,20 @@ export default function App() {
   const [jobs, setJobs] = useState<JobSummary[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [outputsDir, setOutputsDir] = useState<string | null>(null)
+  // While a live job is being stopped, the backend is blocking until ffmpeg
+  // releases the listen port. Any new job started during that window would
+  // hit "Address already in use" and crash — so we lock navigation and show
+  // a snackbar until the cancel call resolves.
+  const [cancelPending, setCancelPending] = useState(false)
+  const [navBlockedToast, setNavBlockedToast] = useState(false)
+
+  const guardedSelect = (id: string | null) => {
+    if (cancelPending) {
+      setNavBlockedToast(true)
+      return
+    }
+    setSelected(id)
+  }
 
   const refreshJobs = async () => {
     try {
@@ -104,14 +118,30 @@ export default function App() {
             alignItems: 'start',
           }}
         >
-          <Sidebar jobs={jobs} selected={selected} onSelect={setSelected} onRefresh={refreshJobs} />
+          <Sidebar jobs={jobs} selected={selected} onSelect={guardedSelect} onRefresh={refreshJobs} />
           <Box>
             {selected
-              ? <JobDetail key={selected} jobId={selected} onChange={refreshJobs} />
+              ? <JobDetail
+                  key={selected}
+                  jobId={selected}
+                  onChange={refreshJobs}
+                  onCancelPendingChange={setCancelPending}
+                />
               : <NewJob onCreated={(id) => { refreshJobs(); setSelected(id) }} />}
           </Box>
         </Box>
       </Container>
+
+      <Snackbar
+        open={navBlockedToast}
+        autoHideDuration={4000}
+        onClose={() => setNavBlockedToast(false)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert severity="warning" variant="filled" onClose={() => setNavBlockedToast(false)}>
+          正在停止前一個任務、釋放監聽埠中，請稍候再切換或建立新任務。
+        </Alert>
+      </Snackbar>
     </Box>
   )
 }
@@ -446,7 +476,11 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
   )
 }
 
-function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void }) {
+function JobDetail({ jobId, onChange, onCancelPendingChange }: {
+  jobId: string
+  onChange: () => void
+  onCancelPendingChange?: (pending: boolean) => void
+}) {
   const [estimate, setEstimate] = useState<Estimate | null>(null)
   const [info, setInfo] = useState<Info | null>(null)
   const [segments, setSegments] = useState<Segment[]>([])
@@ -518,10 +552,26 @@ function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void })
     autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
   }
 
+  const [pendingAction, setPendingAction] = useState<'pause' | 'resume' | 'cancel' | null>(null)
   const action = async (a: 'pause' | 'resume' | 'cancel') => {
-    await fetch(`/api/jobs/${jobId}/${a}`, { method: 'POST' })
-    onChange()
+    setPendingAction(a)
+    if (a === 'cancel') onCancelPendingChange?.(true)
+    try {
+      await fetch(`/api/jobs/${jobId}/${a}`, { method: 'POST' })
+      onChange()
+    } finally {
+      setPendingAction(null)
+      if (a === 'cancel') onCancelPendingChange?.(false)
+    }
   }
+
+  // Safety net: if this JobDetail unmounts while a cancel is pending (e.g.
+  // user navigated away despite the guard), make sure the App-level lock
+  // doesn't get stuck on.
+  useEffect(() => {
+    return () => { onCancelPendingChange?.(false) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const lastEnd = segments.length ? segments[segments.length - 1].end : 0
   const progress = estimate && estimate.duration_seconds > 0 ? Math.min(1, lastEnd / estimate.duration_seconds) : 0
@@ -560,14 +610,34 @@ function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void })
 
           <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
             {!live && status === 'running' && (
-              <Button startIcon={<PauseIcon />} onClick={() => action('pause')}>暫停</Button>
+              <Button
+                startIcon={<PauseIcon />}
+                onClick={() => action('pause')}
+                disabled={pendingAction !== null}
+              >
+                {pendingAction === 'pause' ? '暫停中…' : '暫停'}
+              </Button>
             )}
             {!live && status === 'paused' && (
-              <Button startIcon={<PlayArrowIcon />} onClick={() => action('resume')}>繼續</Button>
+              <Button
+                startIcon={<PlayArrowIcon />}
+                onClick={() => action('resume')}
+                disabled={pendingAction !== null}
+              >
+                {pendingAction === 'resume' ? '繼續中…' : '繼續'}
+              </Button>
             )}
             {isActive && (
-              <Button color="error" variant="contained" startIcon={<StopIcon />} onClick={() => action('cancel')}>
-                {live ? '停止監聽' : '終止'}
+              <Button
+                color="error"
+                variant="contained"
+                startIcon={<StopIcon />}
+                onClick={() => action('cancel')}
+                disabled={pendingAction !== null}
+              >
+                {pendingAction === 'cancel'
+                  ? (live ? '停止中…' : '終止中…')
+                  : (live ? '停止監聽' : '終止')}
               </Button>
             )}
             <Button startIcon={<ContentCopyIcon />} onClick={handleCopy} disabled={!segments.length}>
@@ -598,6 +668,14 @@ function JobDetail({ jobId, onChange }: { jobId: string; onChange: () => void })
       </Card>
 
       {error && <Alert severity="error">錯誤：{error}</Alert>}
+
+      {pendingAction === 'cancel' && (
+        <Alert severity="warning">
+          {live
+            ? '正在停止監聽…等待 ffmpeg 結束並釋放監聽埠（最多 5 秒）。在此期間請不要重複按按鈕。'
+            : '正在終止任務…等待 worker 行程結束（最多 5 秒）。'}
+        </Alert>
+      )}
 
       {live && (
         <Alert severity="info" icon={<VideocamIcon />}>

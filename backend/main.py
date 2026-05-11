@@ -554,6 +554,20 @@ def cancel_job(job_id: str) -> dict:
         _signal_worker(job, signal.SIGTERM)
         job.status = "cancelled"
         _emit_state(job)
+        # Block until the worker (and its ffmpeg child) actually exit. For live
+        # jobs this releases the listen port (e.g. tcp://0.0.0.0:9999) before
+        # the next job tries to bind it — otherwise the next ffmpeg fails fast
+        # with "Address already in use" and the new job appears to crash.
+        proc = job.process
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _signal_worker(job, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
     return {"ok": True, "status": job.status}
 
 
