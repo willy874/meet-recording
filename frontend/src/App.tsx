@@ -4,6 +4,7 @@ import {
   Button, IconButton, TextField, MenuItem, Select, FormControlLabel, Checkbox,
   Tabs, Tab, Chip, List, ListItem, ListItemButton, ListItemText, LinearProgress,
   Alert, Tooltip, InputLabel, FormControl, useColorScheme, Divider, Snackbar,
+  ToggleButton, ToggleButtonGroup,
 } from '@mui/material'
 import AddIcon from '@mui/icons-material/Add'
 import RefreshIcon from '@mui/icons-material/Refresh'
@@ -293,21 +294,68 @@ function Sidebar({ jobs, selected, onSelect, onRefresh }: {
   )
 }
 
+const NEWJOB_PREFS_KEY = 'meet.newjob.prefs.v1'
+type NewJobPrefs = {
+  mode: 'file' | 'live'
+  language: string
+  vad: boolean
+  listenUrl: string
+  chunkSeconds: number
+  label: string
+  record: boolean
+  recordKind: 'audio' | 'video'
+  recordAudioFormat: 'm4a' | 'mp3' | 'wav'
+  recordVideoFormat: 'mkv' | 'mp4' | 'ts'
+}
+const NEWJOB_DEFAULTS: NewJobPrefs = {
+  mode: 'file',
+  language: 'zh-TW',
+  vad: true,
+  listenUrl: 'tcp://0.0.0.0:9999?listen=1',
+  chunkSeconds: 6,
+  label: '',
+  record: false,
+  recordKind: 'audio',
+  recordAudioFormat: 'm4a',
+  recordVideoFormat: 'mkv',
+}
+const loadNewJobPrefs = (): NewJobPrefs => {
+  try {
+    const raw = localStorage.getItem(NEWJOB_PREFS_KEY)
+    if (!raw) return NEWJOB_DEFAULTS
+    return { ...NEWJOB_DEFAULTS, ...(JSON.parse(raw) as Partial<NewJobPrefs>) }
+  } catch {
+    return NEWJOB_DEFAULTS
+  }
+}
+
 function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
-  const [mode, setMode] = useState<'file' | 'live'>('file')
+  const initial = loadNewJobPrefs()
+  const [mode, setMode] = useState<'file' | 'live'>(initial.mode)
   const [file, setFile] = useState<File | null>(null)
-  const [language, setLanguage] = useState('zh-TW')
-  const [vad, setVad] = useState(true)
-  const [listenUrl, setListenUrl] = useState('tcp://0.0.0.0:9999?listen=1')
-  const [chunkSeconds, setChunkSeconds] = useState(6)
-  const [label, setLabel] = useState('')
-  const [record, setRecord] = useState(false)
-  const [recordFormat, setRecordFormat] = useState<'mkv' | 'mp4' | 'ts'>('mkv')
+  const [language, setLanguage] = useState(initial.language)
+  const [vad, setVad] = useState(initial.vad)
+  const [listenUrl, setListenUrl] = useState(initial.listenUrl)
+  const [chunkSeconds, setChunkSeconds] = useState(initial.chunkSeconds)
+  const [label, setLabel] = useState(initial.label)
+  const [record, setRecord] = useState(initial.record)
+  const [recordKind, setRecordKind] = useState<'audio' | 'video'>(initial.recordKind)
+  const [recordAudioFormat, setRecordAudioFormat] = useState<'m4a' | 'mp3' | 'wav'>(initial.recordAudioFormat)
+  const [recordVideoFormat, setRecordVideoFormat] = useState<'mkv' | 'mp4' | 'ts'>(initial.recordVideoFormat)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const persistPrefs = () => {
+    const prefs: NewJobPrefs = {
+      mode, language, vad, listenUrl, chunkSeconds, label,
+      record, recordKind, recordAudioFormat, recordVideoFormat,
+    }
+    try { localStorage.setItem(NEWJOB_PREFS_KEY, JSON.stringify(prefs)) } catch { /* ignore quota */ }
+  }
+
   const handleStartFile = async () => {
     if (!file || submitting) return
+    persistPrefs()
     setSubmitting(true); setError(null)
     const form = new FormData()
     form.append('file', file)
@@ -327,6 +375,7 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
 
   const handleStartLive = async () => {
     if (!listenUrl || submitting) return
+    persistPrefs()
     setSubmitting(true); setError(null)
     const form = new FormData()
     form.append('listen_url', listenUrl)
@@ -335,7 +384,10 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
     form.append('chunk_seconds', String(chunkSeconds))
     if (label) form.append('label', label)
     form.append('record', record ? 'true' : 'false')
-    if (record) form.append('record_format', recordFormat)
+    if (record) {
+      form.append('record_kind', recordKind)
+      form.append('record_format', recordKind === 'audio' ? recordAudioFormat : recordVideoFormat)
+    }
     try {
       const r = await fetch('/api/live', { method: 'POST', body: form })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -404,21 +456,47 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
               control={
                 <Checkbox checked={record} onChange={(e) => setRecord(e.target.checked)} />
               }
-              label="同步保留影片檔（不重編，存到 outputs/）"
+              label="同步保留原始檔（存到 outputs/）"
             />
             {record && (
-              <FormControl size="small" sx={{ maxWidth: 320 }}>
-                <InputLabel>格式</InputLabel>
-                <Select
-                  label="格式"
-                  value={recordFormat}
-                  onChange={(e) => setRecordFormat(e.target.value as 'mkv' | 'mp4' | 'ts')}
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems={{ sm: 'center' }}>
+                <ToggleButtonGroup
+                  size="small"
+                  exclusive
+                  value={recordKind}
+                  onChange={(_, v) => v && setRecordKind(v)}
                 >
-                  <MenuItem value="mkv">mkv（推薦，串流斷掉也不會壞）</MenuItem>
-                  <MenuItem value="mp4">mp4</MenuItem>
-                  <MenuItem value="ts">ts</MenuItem>
-                </Select>
-              </FormControl>
+                  <ToggleButton value="audio">純音檔</ToggleButton>
+                  <ToggleButton value="video">影片（含音訊）</ToggleButton>
+                </ToggleButtonGroup>
+                {recordKind === 'audio' ? (
+                  <FormControl size="small" sx={{ maxWidth: 320, minWidth: 200 }}>
+                    <InputLabel>格式</InputLabel>
+                    <Select
+                      label="格式"
+                      value={recordAudioFormat}
+                      onChange={(e) => setRecordAudioFormat(e.target.value as 'm4a' | 'mp3' | 'wav')}
+                    >
+                      <MenuItem value="m4a">m4a（推薦，不重編）</MenuItem>
+                      <MenuItem value="mp3">mp3（重編，相容性最高）</MenuItem>
+                      <MenuItem value="wav">wav（無損，檔案大）</MenuItem>
+                    </Select>
+                  </FormControl>
+                ) : (
+                  <FormControl size="small" sx={{ maxWidth: 320, minWidth: 200 }}>
+                    <InputLabel>格式</InputLabel>
+                    <Select
+                      label="格式"
+                      value={recordVideoFormat}
+                      onChange={(e) => setRecordVideoFormat(e.target.value as 'mkv' | 'mp4' | 'ts')}
+                    >
+                      <MenuItem value="mkv">mkv（推薦，串流斷掉也不會壞）</MenuItem>
+                      <MenuItem value="mp4">mp4</MenuItem>
+                      <MenuItem value="ts">ts</MenuItem>
+                    </Select>
+                  </FormControl>
+                )}
+              </Stack>
             )}
             <Alert severity="info" variant="outlined">
               <Typography variant="body2" component="div">
@@ -491,6 +569,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [listenUrl, setListenUrl] = useState<string | null>(null)
   const [listening, setListening] = useState<boolean>(false)
   const [recordPath, setRecordPath] = useState<string | null>(null)
+  const [recordKind, setRecordKind] = useState<'audio' | 'video' | null>(null)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const autoScrollRef = useRef(true)
 
@@ -501,6 +580,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       setLive(!!j.live)
       setListenUrl(j.listen_url || null)
       setRecordPath(j.record_path || null)
+      setRecordKind(j.record_kind || null)
     })
     const ctrl = new AbortController()
     ;(async () => {
@@ -660,7 +740,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
                 startIcon={<DownloadIcon />}
                 disabled={isActive}
               >
-                下載錄影
+                {recordKind === 'audio' ? '下載音檔' : '下載錄影'}
               </Button>
             )}
           </Stack>
@@ -681,7 +761,11 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
         <Alert severity="info" icon={<VideocamIcon />}>
           🔴 直播模式 · 監聽：<code>{listenUrl}</code>{' '}
           {listening ? '（已就緒，等待 OBS 連入或音訊…）' : '（啟動中，模型載入後會開始監聽）'}
-          {recordPath && <Box sx={{ mt: 0.5 }}>🎬 同步錄影：<code>{recordPath}</code></Box>}
+          {recordPath && (
+            <Box sx={{ mt: 0.5 }}>
+              {recordKind === 'audio' ? '🎙️ 同步錄音' : '🎬 同步錄影'}：<code>{recordPath}</code>
+            </Box>
+          )}
         </Alert>
       )}
       {estimate && !info && (

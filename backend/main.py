@@ -180,6 +180,7 @@ class Job:
     listen_url: Optional[str] = None
     chunk_seconds: float = 6.0
     record_path: Optional[str] = None
+    record_kind: Optional[str] = None  # "audio" | "video"
 
     def summary(self) -> dict:
         last_end = self.segments[-1]["end"] if self.segments else 0
@@ -199,6 +200,7 @@ class Job:
             "live": self.live,
             "listen_url": self.listen_url,
             "record_path": self.record_path,
+            "record_kind": self.record_kind,
             "output_path": self.output_path,
         }
 
@@ -317,6 +319,7 @@ async def _run_live_job(job: Job) -> None:
         "beam_size": job.beam_size,
         "chunk_seconds": job.chunk_seconds,
         "record_path": job.record_path,
+        "record_kind": job.record_kind,
         "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
     }
     proc.stdin.write(json.dumps(config) + "\n")
@@ -441,16 +444,22 @@ async def create_live_job(
     chunk_seconds: float = Form(6.0),
     label: Optional[str] = Form(None),
     record: bool = Form(False),
-    record_format: str = Form("mkv"),
+    record_kind: str = Form("audio"),
+    record_format: str = Form("m4a"),
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
     job_id = uuid.uuid4().hex[:12]
     job_dir = reserve_job_dir()
     record_path: Optional[str] = None
+    kind = record_kind if record_kind in {"audio", "video"} else "audio"
     if record:
-        ext = (record_format or "mkv").lstrip(".").lower()
-        if ext not in {"mkv", "mp4", "ts", "flv", "mov"}:
-            ext = "mkv"
+        ext = (record_format or "").lstrip(".").lower()
+        if kind == "audio":
+            if ext not in {"m4a", "mp3", "wav"}:
+                ext = "m4a"
+        else:
+            if ext not in {"mkv", "mp4", "ts", "flv", "mov"}:
+                ext = "mkv"
         record_path = str(job_file(job_dir, "recording", ext))
     job = Job(
         id=job_id,
@@ -464,12 +473,13 @@ async def create_live_job(
         listen_url=listen_url,
         chunk_seconds=chunk_seconds,
         record_path=record_path,
+        record_kind=kind if record else None,
     )
     JOBS[job_id] = job
     asyncio.create_task(_run_live_job(job))
     return {
         "id": job_id, "listen_url": listen_url, "chunk_seconds": chunk_seconds,
-        "record_path": record_path,
+        "record_path": record_path, "record_kind": job.record_kind,
     }
 
 

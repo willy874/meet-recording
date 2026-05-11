@@ -81,7 +81,8 @@ def main():
     device = config.get("device", "cpu")
     compute = config.get("compute", "int8")
     chunk_seconds = float(config.get("chunk_seconds", 6.0))
-    record_path = config.get("record_path")  # optional .mkv path to mux a copy of the stream
+    record_path = config.get("record_path")  # optional path to mux a copy of the stream
+    record_kind = config.get("record_kind", "video")  # "video" (stream-copy all) | "audio" (audio only)
     chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
 
     signal.signal(signal.SIGTERM, _on_term)
@@ -97,8 +98,20 @@ def main():
         "-i", listen_url,
     ]
     if record_path:
-        # Output 1: stream-copy everything (video+audio) to a local file. No re-encode.
-        ffmpeg_args += ["-map", "0", "-c", "copy", record_path]
+        # Output 1: persist a local copy of the stream. For "video" kind we
+        # stream-copy everything (video+audio) — no re-encode. For "audio" kind
+        # we keep just the audio track; OBS' mpegts pipeline produces AAC, so
+        # m4a/aac stream-copies cleanly; mp3/wav must re-encode.
+        if record_kind == "audio":
+            ext = os.path.splitext(record_path)[1].lower().lstrip(".")
+            if ext == "mp3":
+                ffmpeg_args += ["-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "192k", record_path]
+            elif ext == "wav":
+                ffmpeg_args += ["-map", "0:a:0", "-c:a", "pcm_s16le", record_path]
+            else:  # m4a / aac / mp4 audio-only
+                ffmpeg_args += ["-map", "0:a:0", "-c:a", "copy", record_path]
+        else:
+            ffmpeg_args += ["-map", "0", "-c", "copy", record_path]
     # Output 2: 16k mono PCM on stdout for whisper.
     ffmpeg_args += [
         "-map", "0:a:0",
