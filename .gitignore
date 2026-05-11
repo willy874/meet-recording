@@ -31,3 +31,5 @@ frontend/.vite/
 # Project data — never commit user audio or generated transcripts
 inputs/
 outputs/
+
+.claude/skills/skymove-mom
