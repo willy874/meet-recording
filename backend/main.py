@@ -713,6 +713,15 @@ def cancel_job(job_id: str) -> dict:
     return {"ok": True, "status": job.status}
 
 
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str) -> dict:
+    job = JOBS.get(job_id) or _404()
+    if job.status in ("running", "paused", "queued"):
+        raise HTTPException(409, "job is still active; cancel it first")
+    JOBS.pop(job_id, None)
+    return {"ok": True}
+
+
 @app.get("/api/jobs/{job_id}/output")
 def download_output(job_id: str) -> FileResponse:
     job = JOBS.get(job_id) or _404()

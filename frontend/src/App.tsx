@@ -15,6 +15,7 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import DownloadIcon from '@mui/icons-material/Download'
 import VideocamIcon from '@mui/icons-material/Videocam'
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutlineOutlined'
 import LightModeIcon from '@mui/icons-material/LightMode'
 import DarkModeIcon from '@mui/icons-material/DarkMode'
 import SettingsBrightnessIcon from '@mui/icons-material/SettingsBrightness'
@@ -56,6 +57,7 @@ export default function App() {
   // a snackbar until the cancel call resolves.
   const [cancelPending, setCancelPending] = useState(false)
   const [navBlockedToast, setNavBlockedToast] = useState(false)
+  const initialSelectDone = useRef(false)
 
   const guardedSelect = (id: string | null) => {
     if (cancelPending) {
@@ -70,7 +72,10 @@ export default function App() {
       const r = await fetch('/api/jobs')
       const data = await r.json()
       setJobs(data.jobs)
-      if (selected === null && data.jobs.length > 0) setSelected(data.jobs[0].id)
+      if (!initialSelectDone.current && data.jobs.length > 0) {
+        setSelected(data.jobs[0].id)
+      }
+      initialSelectDone.current = true
     } catch { /* ignore */ }
   }
 
@@ -119,7 +124,16 @@ export default function App() {
             alignItems: 'start',
           }}
         >
-          <Sidebar jobs={jobs} selected={selected} onSelect={guardedSelect} onRefresh={refreshJobs} />
+          <Sidebar
+            jobs={jobs}
+            selected={selected}
+            onSelect={guardedSelect}
+            onRefresh={refreshJobs}
+            onDeleted={(id) => {
+              setJobs((prev) => prev.filter((j) => j.id !== id))
+              if (selected === id) setSelected(null)
+            }}
+          />
           <Box>
             {selected
               ? <JobDetail
@@ -234,10 +248,24 @@ function ColorSchemeToggle() {
   )
 }
 
-function Sidebar({ jobs, selected, onSelect, onRefresh }: {
+function Sidebar({ jobs, selected, onSelect, onRefresh, onDeleted }: {
   jobs: JobSummary[]; selected: string | null;
   onSelect: (id: string | null) => void; onRefresh: () => void;
+  onDeleted: (id: string) => void;
 }) {
+  const [deleting, setDeleting] = useState<string | null>(null)
+  const isTerminal = (s: JobStatus) => s === 'done' || s === 'error' || s === 'cancelled'
+
+  const handleDelete = async (id: string) => {
+    setDeleting(id)
+    try {
+      const r = await fetch(`/api/jobs/${id}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      onDeleted(id)
+    } catch { /* keep UI; next refresh will reconcile */ }
+    finally { setDeleting(null) }
+  }
+
   return (
     <Card sx={{ position: { md: 'sticky' }, top: { md: 88 } }}>
       <CardContent>
@@ -262,7 +290,25 @@ function Sidebar({ jobs, selected, onSelect, onRefresh }: {
             </Typography>
           )}
           {jobs.map((j) => (
-            <ListItem key={j.id} disablePadding sx={{ mb: 0.5 }}>
+            <ListItem
+              key={j.id}
+              disablePadding
+              sx={{ mb: 0.5 }}
+              secondaryAction={isTerminal(j.status) ? (
+                <Tooltip title="從清單移除">
+                  <span>
+                    <IconButton
+                      edge="end"
+                      size="small"
+                      disabled={deleting === j.id}
+                      onClick={(e) => { e.stopPropagation(); handleDelete(j.id) }}
+                    >
+                      <DeleteOutlineIcon fontSize="small" />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              ) : null}
+            >
               <ListItemButton
                 selected={j.id === selected}
                 onClick={() => onSelect(j.id)}
