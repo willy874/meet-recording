@@ -142,10 +142,12 @@ export default function App() {
                   onChange={refreshJobs}
                   onCancelPendingChange={setCancelPending}
                 />
-              : <NewJob onCreated={(id, autoSelect = true) => {
-                  refreshJobs()
-                  if (autoSelect) setSelected(id)
-                }} />}
+              : <NewJob
+                  defaultOutputsDir={outputsDir}
+                  onCreated={(id, autoSelect = true) => {
+                    refreshJobs()
+                    if (autoSelect) setSelected(id)
+                  }} />}
           </Box>
         </Box>
       </Container>
@@ -169,9 +171,28 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [picking, setPicking] = useState(false)
 
   const startEdit = () => { setDraft(value ?? ''); setError(null); setEditing(true) }
   const cancel = () => { setEditing(false); setError(null) }
+
+  const pickFolder = async () => {
+    setError(null)
+    setPicking(true)
+    try {
+      const r = await fetch('/api/outputs-dir/pick', { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      const path = (data?.path as string) || ''
+      if (!path) return // cancelled
+      if (!editing) setEditing(true)
+      setDraft(path)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setPicking(false)
+    }
+  }
 
   const save = async () => {
     const path = draft.trim()
@@ -198,9 +219,11 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
     <Card variant="outlined" sx={{ mb: 0 }}>
       <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ alignItems: { sm: 'center' } }}>
-          <Typography variant="body2" color="text.secondary" sx={{ flexShrink: 0 }}>
-            輸出資料夾
-          </Typography>
+          <Tooltip title="新任務沒有指定輸出資料夾時的預設位置；每個任務可自行覆寫">
+            <Typography variant="body2" color="text.secondary" sx={{ flexShrink: 0 }}>
+              預設輸出資料夾
+            </Typography>
+          </Tooltip>
           {editing ? (
             <>
               <TextField
@@ -214,6 +237,13 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
                 onKeyDown={(e) => { if (e.key === 'Enter') save() }}
               />
               <Stack direction="row" spacing={1}>
+                <Tooltip title="開啟本機原生資料夾選擇對話框">
+                  <span>
+                    <Button size="small" onClick={pickFolder} disabled={saving || picking}>
+                      {picking ? '選擇中…' : '選擇…'}
+                    </Button>
+                  </span>
+                </Tooltip>
                 <Button size="small" variant="contained" onClick={save} disabled={saving || !draft.trim()}>儲存</Button>
                 <Button size="small" onClick={cancel} disabled={saving}>取消</Button>
               </Stack>
@@ -226,7 +256,16 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
               >
                 {value || '（載入中…）'}
               </Typography>
-              <Button size="small" onClick={startEdit} disabled={!value}>變更</Button>
+              <Stack direction="row" spacing={1}>
+                <Tooltip title="開啟本機原生資料夾選擇對話框">
+                  <span>
+                    <Button size="small" onClick={pickFolder} disabled={!value || picking}>
+                      {picking ? '選擇中…' : '選擇…'}
+                    </Button>
+                  </span>
+                </Tooltip>
+                <Button size="small" onClick={startEdit} disabled={!value}>變更</Button>
+              </Stack>
             </>
           )}
         </Stack>
@@ -355,10 +394,11 @@ type NewJobPrefs = {
   recordKind: 'audio' | 'video'
   recordAudioFormat: 'm4a' | 'mp3' | 'wav'
   recordVideoFormat: 'mkv' | 'mp4' | 'ts'
+  outputDir: string
 }
 const NEWJOB_DEFAULTS: NewJobPrefs = {
   mode: 'file',
-  language: 'zh-TW',
+  language: 'auto',
   vad: true,
   listenUrl: 'tcp://0.0.0.0:9999?listen=1',
   chunkSeconds: 6,
@@ -367,6 +407,7 @@ const NEWJOB_DEFAULTS: NewJobPrefs = {
   recordKind: 'audio',
   recordAudioFormat: 'm4a',
   recordVideoFormat: 'mkv',
+  outputDir: '',
 }
 const loadNewJobPrefs = (): NewJobPrefs => {
   try {
@@ -378,7 +419,10 @@ const loadNewJobPrefs = (): NewJobPrefs => {
   }
 }
 
-function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) => void }) {
+function NewJob({ onCreated, defaultOutputsDir }: {
+  onCreated: (id: string, autoSelect?: boolean) => void
+  defaultOutputsDir: string | null
+}) {
   const initial = loadNewJobPrefs()
   const [mode, setMode] = useState<'file' | 'live'>(initial.mode)
   const [files, setFiles] = useState<File[]>([])
@@ -392,8 +436,25 @@ function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) =
   const [recordKind, setRecordKind] = useState<'audio' | 'video'>(initial.recordKind)
   const [recordAudioFormat, setRecordAudioFormat] = useState<'m4a' | 'mp3' | 'wav'>(initial.recordAudioFormat)
   const [recordVideoFormat, setRecordVideoFormat] = useState<'mkv' | 'mp4' | 'ts'>(initial.recordVideoFormat)
+  const [outputDir, setOutputDir] = useState(initial.outputDir)
+  const [pickingOutputDir, setPickingOutputDir] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const pickOutputDir = async () => {
+    setPickingOutputDir(true)
+    try {
+      const r = await fetch('/api/outputs-dir/pick', { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      const path = (data?.path as string) || ''
+      if (path) setOutputDir(path)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setPickingOutputDir(false)
+    }
+  }
 
   // When entering live mode, ask the backend for a listen URL whose port
   // isn't already used by another active live job — that's what makes
@@ -422,6 +483,7 @@ function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) =
     const prefs: NewJobPrefs = {
       mode, language, vad, listenUrl, chunkSeconds, label,
       record, recordKind, recordAudioFormat, recordVideoFormat,
+      outputDir,
     }
     try { localStorage.setItem(NEWJOB_PREFS_KEY, JSON.stringify(prefs)) } catch { /* ignore quota */ }
   }
@@ -439,6 +501,7 @@ function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) =
       form.append('file', f)
       if (language) form.append('language', language)
       form.append('vad', vad ? 'true' : 'false')
+      if (outputDir.trim()) form.append('output_dir', outputDir.trim())
       try {
         const r = await fetch('/api/jobs', { method: 'POST', body: form })
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -476,6 +539,7 @@ function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) =
       form.append('record_kind', recordKind)
       form.append('record_format', recordKind === 'audio' ? recordAudioFormat : recordVideoFormat)
     }
+    if (outputDir.trim()) form.append('output_dir', outputDir.trim())
     try {
       const r = await fetch('/api/live', { method: 'POST', body: form })
       if (!r.ok) {
@@ -667,6 +731,30 @@ function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) =
             </Alert>
           </Stack>
         )}
+
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 2, alignItems: { sm: 'center' } }}>
+          <TextField
+            size="small"
+            label="輸出資料夾（留空則用預設）"
+            value={outputDir}
+            onChange={(e) => setOutputDir(e.target.value)}
+            placeholder={defaultOutputsDir ?? '/絕對路徑/到/輸出資料夾'}
+            fullWidth
+            slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } } }}
+          />
+          <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+            <Tooltip title="開啟本機原生資料夾選擇對話框">
+              <span>
+                <Button size="small" onClick={pickOutputDir} disabled={pickingOutputDir} sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}>
+                  {pickingOutputDir ? '選擇中…' : '選擇…'}
+                </Button>
+              </span>
+            </Tooltip>
+            {outputDir && (
+              <Button size="small" onClick={() => setOutputDir('')} sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}>清除</Button>
+            )}
+          </Stack>
+        </Stack>
 
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ mb: 3 }}>
           <FormControl size="small" sx={{ minWidth: 180 }}>

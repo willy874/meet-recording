@@ -100,22 +100,38 @@ def set_outputs_dir(path: Path) -> Path:
     return resolved
 
 
-def reserve_job_dir() -> Path:
-    """Reserve and create a fresh `{YYYYMMDDHHmmss}-{idx}/` directory inside outputs.
+def resolve_job_base_dir(raw: Optional[str]) -> Path:
+    """Resolve an optional per-job output folder, falling back to the global default.
 
-    Reservations are tracked in-memory so two jobs created in the same second
-    don't collide before either has written its first file.
+    The frontend (or CLI) may attach an `output_dir` to each job request — we
+    expand `~`, resolve to absolute, and ensure the directory exists. When
+    `raw` is falsy we route the job into the global `_OUTPUTS_DIR`.
+    """
+    if raw and raw.strip():
+        base = Path(raw.strip()).expanduser().resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    return get_outputs_dir()
+
+
+def reserve_job_dir(base: Optional[Path] = None) -> Path:
+    """Reserve and create a fresh `{YYYYMMDDHHmmss}-{idx}/` directory inside `base`.
+
+    Reservations are tracked in-memory (keyed by absolute path) so two jobs
+    created in the same second don't collide — even when each job picks its
+    own base folder.
     """
     while True:
         ts = time.strftime("%Y%m%d%H%M%S")
-        outputs = get_outputs_dir()
+        outputs = base if base is not None else get_outputs_dir()
         with _OUTPUTS_LOCK:
             idx = 1
             while True:
                 name = f"{ts}-{idx}"
                 path = outputs / name
-                if name not in _RESERVED_NAMES and not path.exists():
-                    _RESERVED_NAMES.add(name)
+                key = str(path)
+                if key not in _RESERVED_NAMES and not path.exists():
+                    _RESERVED_NAMES.add(key)
                     path.mkdir(parents=True, exist_ok=True)
                     return path
                 idx += 1
@@ -417,15 +433,63 @@ def update_outputs_dir(payload: dict = Body(...)) -> dict:
     return {"outputs_dir": str(resolved)}
 
 
+@app.post("/api/outputs-dir/pick")
+def pick_outputs_dir() -> dict:
+    """Open a native folder picker on the machine running the backend.
+
+    Returns the chosen absolute path (without persisting it) so the UI can
+    preview/confirm before saving. Returns 204-ish empty path if cancelled.
+    """
+    start = str(get_outputs_dir())
+    chosen: Optional[str] = None
+    if sys.platform == "darwin":
+        script = (
+            'POSIX path of (choose folder with prompt "選擇輸出資料夾"'
+            f' default location POSIX file "{start}")'
+        )
+        try:
+            out = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=300,
+            )
+            if out.returncode == 0:
+                chosen = out.stdout.strip().rstrip("/")
+            elif "User canceled" in (out.stderr or "") or out.returncode == 1:
+                chosen = None
+            else:
+                raise HTTPException(500, f"osascript failed: {out.stderr.strip()}")
+        except FileNotFoundError as exc:
+            raise HTTPException(500, "osascript not available") from exc
+    else:
+        try:
+            import tkinter  # noqa: WPS433
+            from tkinter import filedialog  # noqa: WPS433
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            picked = filedialog.askdirectory(initialdir=start, title="選擇輸出資料夾")
+            root.destroy()
+            chosen = picked or None
+        except Exception as exc:  # tk not installed, no display, etc.
+            raise HTTPException(500, f"native folder picker unavailable: {exc}") from exc
+    return {"path": chosen or ""}
+
+
 @app.post("/api/jobs")
 async def create_job(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     vad: bool = Form(True),
     beam_size: int = Form(5),
+    output_dir: Optional[str] = Form(None),
 ) -> dict:
     if not file.filename:
         raise HTTPException(400, "missing filename")
+
+    try:
+        base_dir = resolve_job_base_dir(output_dir)
+    except OSError as exc:
+        raise HTTPException(400, f"cannot use output_dir: {exc}") from exc
 
     suffix = Path(file.filename).suffix or ".bin"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -437,7 +501,7 @@ async def create_job(
         await file.close()
 
     job_id = uuid.uuid4().hex[:12]
-    job_dir = reserve_job_dir()
+    job_dir = reserve_job_dir(base_dir)
     job = Job(
         id=job_id,
         filename=file.filename,
@@ -562,8 +626,13 @@ async def create_live_job(
     record: bool = Form(False),
     record_kind: str = Form("audio"),
     record_format: str = Form("m4a"),
+    output_dir: Optional[str] = Form(None),
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
+    try:
+        base_dir = resolve_job_base_dir(output_dir)
+    except OSError as exc:
+        raise HTTPException(400, f"cannot use output_dir: {exc}") from exc
     conflict = _conflicting_live_job(listen_url)
     if conflict is not None:
         suggested = _suggest_free_listen_url(listen_url)
@@ -581,7 +650,7 @@ async def create_live_job(
             },
         )
     job_id = uuid.uuid4().hex[:12]
-    job_dir = reserve_job_dir()
+    job_dir = reserve_job_dir(base_dir)
     record_path: Optional[str] = None
     kind = record_kind if record_kind in {"audio", "video"} else "audio"
     if record:
