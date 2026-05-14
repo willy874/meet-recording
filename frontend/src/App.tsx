@@ -128,7 +128,10 @@ export default function App() {
                   onChange={refreshJobs}
                   onCancelPendingChange={setCancelPending}
                 />
-              : <NewJob onCreated={(id) => { refreshJobs(); setSelected(id) }} />}
+              : <NewJob onCreated={(id, autoSelect = true) => {
+                  refreshJobs()
+                  if (autoSelect) setSelected(id)
+                }} />}
           </Box>
         </Box>
       </Container>
@@ -329,10 +332,11 @@ const loadNewJobPrefs = (): NewJobPrefs => {
   }
 }
 
-function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
+function NewJob({ onCreated }: { onCreated: (id: string, autoSelect?: boolean) => void }) {
   const initial = loadNewJobPrefs()
   const [mode, setMode] = useState<'file' | 'live'>(initial.mode)
-  const [file, setFile] = useState<File | null>(null)
+  const [files, setFiles] = useState<File[]>([])
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
   const [language, setLanguage] = useState(initial.language)
   const [vad, setVad] = useState(initial.vad)
   const [listenUrl, setListenUrl] = useState(initial.listenUrl)
@@ -345,6 +349,29 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // When entering live mode, ask the backend for a listen URL whose port
+  // isn't already used by another active live job — that's what makes
+  // running multiple OBS streams (one per port) work without collision.
+  useEffect(() => {
+    if (mode !== 'live') return
+    const ctrl = new AbortController()
+    ;(async () => {
+      try {
+        const r = await fetch(`/api/live/suggest?base=${encodeURIComponent(listenUrl)}`, { signal: ctrl.signal })
+        if (!r.ok) return
+        const data = await r.json()
+        const suggested = data.listen_url as string | undefined
+        if (suggested && suggested !== listenUrl) {
+          setListenUrl(suggested)
+        }
+      } catch { /* ignore — keep whatever the user already has */ }
+    })()
+    return () => ctrl.abort()
+    // Only re-run when switching tabs; we don't want to fight the user
+    // while they're typing into the field.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
+
   const persistPrefs = () => {
     const prefs: NewJobPrefs = {
       mode, language, vad, listenUrl, chunkSeconds, label,
@@ -354,22 +381,37 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
   }
 
   const handleStartFile = async () => {
-    if (!file || submitting) return
+    if (files.length === 0 || submitting) return
     persistPrefs()
     setSubmitting(true); setError(null)
-    const form = new FormData()
-    form.append('file', file)
-    if (language) form.append('language', language)
-    form.append('vad', vad ? 'true' : 'false')
-    try {
-      const r = await fetch('/api/jobs', { method: 'POST', body: form })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const data = await r.json()
-      onCreated(data.id)
-    } catch (e) {
-      setError((e as Error).message)
-    } finally {
-      setSubmitting(false)
+    setBatchProgress({ done: 0, total: files.length })
+    const errors: string[] = []
+    let lastId: string | null = null
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      const form = new FormData()
+      form.append('file', f)
+      if (language) form.append('language', language)
+      form.append('vad', vad ? 'true' : 'false')
+      try {
+        const r = await fetch('/api/jobs', { method: 'POST', body: form })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const data = await r.json()
+        lastId = data.id
+        // refresh sidebar after every job; do NOT auto-select so user stays on the form
+        onCreated(data.id, false)
+      } catch (e) {
+        errors.push(`${f.name}: ${(e as Error).message}`)
+      }
+      setBatchProgress({ done: i + 1, total: files.length })
+    }
+    if (errors.length) setError(errors.join('\n'))
+    setBatchProgress(null)
+    setSubmitting(false)
+    if (errors.length === 0) {
+      setFiles([])
+      // single file: keep legacy behavior of jumping to detail
+      if (files.length === 1 && lastId) onCreated(lastId, true)
     }
   }
 
@@ -390,7 +432,19 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
     }
     try {
       const r = await fetch('/api/live', { method: 'POST', body: form })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      if (!r.ok) {
+        const payload = await r.json().catch(() => null)
+        const detail = payload?.detail
+        if (r.status === 409 && detail && typeof detail === 'object') {
+          const suggested = detail.suggested_listen_url as string | undefined
+          if (suggested) setListenUrl(suggested)
+          throw new Error(
+            `${detail.message || '監聽埠衝突'}` +
+            (suggested ? `\n已自動建議改用：${suggested}（再按一次開始監聽）` : ''),
+          )
+        }
+        throw new Error(typeof detail === 'string' ? detail : `HTTP ${r.status}`)
+      }
       const data = await r.json()
       onCreated(data.id)
     } catch (e) {
@@ -416,15 +470,73 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
 
         {mode === 'file' ? (
           <Box sx={{ mb: 2 }}>
-            <Button variant="outlined" component="label">
-              {file ? file.name : '選擇音訊／影片檔'}
-              <input
-                hidden
-                type="file"
-                accept="audio/*,video/*"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              />
-            </Button>
+            <Stack direction="row" spacing={1} sx={{ mb: files.length ? 1 : 0, alignItems: 'center' }}>
+              <Button variant="outlined" component="label">
+                {files.length === 0
+                  ? '選擇音訊／影片檔（可多選）'
+                  : `已選 ${files.length} 個檔案（再點可累加）`}
+                <input
+                  hidden
+                  type="file"
+                  accept="audio/*,video/*"
+                  multiple
+                  onChange={(e) => {
+                    const picked = Array.from(e.target.files ?? [])
+                    if (picked.length === 0) return
+                    setFiles((prev) => {
+                      const seen = new Set(prev.map((f) => `${f.name}|${f.size}|${f.lastModified}`))
+                      const merged = [...prev]
+                      for (const f of picked) {
+                        const key = `${f.name}|${f.size}|${f.lastModified}`
+                        if (!seen.has(key)) { merged.push(f); seen.add(key) }
+                      }
+                      return merged
+                    })
+                    // allow re-picking the same file later
+                    e.target.value = ''
+                  }}
+                />
+              </Button>
+              {files.length > 0 && (
+                <Button size="small" onClick={() => setFiles([])} disabled={submitting}>清空</Button>
+              )}
+            </Stack>
+            {files.length > 0 && (
+              <List dense disablePadding sx={{ maxHeight: 200, overflowY: 'auto', border: 1, borderColor: 'divider', borderRadius: 1 }}>
+                {files.map((f, i) => (
+                  <ListItem
+                    key={`${f.name}-${f.size}-${f.lastModified}-${i}`}
+                    secondaryAction={
+                      <Button
+                        size="small"
+                        onClick={() => setFiles((prev) => prev.filter((_, idx) => idx !== i))}
+                        disabled={submitting}
+                      >
+                        移除
+                      </Button>
+                    }
+                  >
+                    <ListItemText
+                      primary={f.name}
+                      secondary={`${(f.size / (1024 * 1024)).toFixed(1)} MB`}
+                      slotProps={{ primary: { noWrap: true, variant: 'body2' } }}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            )}
+            {batchProgress && (
+              <Box sx={{ mt: 1 }}>
+                <Typography variant="caption" color="text.secondary">
+                  建立任務中… {batchProgress.done}/{batchProgress.total}
+                </Typography>
+                <LinearProgress
+                  variant="determinate"
+                  value={(batchProgress.done / Math.max(1, batchProgress.total)) * 100}
+                  sx={{ mt: 0.5, height: 4, borderRadius: 2 }}
+                />
+              </Box>
+            )}
           </Box>
         ) : (
           <Stack spacing={2} sx={{ mb: 2 }}>
@@ -532,10 +644,10 @@ function NewJob({ onCreated }: { onCreated: (id: string) => void }) {
           <Button
             variant="contained"
             onClick={handleStartFile}
-            disabled={!file || submitting}
+            disabled={files.length === 0 || submitting}
             startIcon={<PlayArrowIcon />}
           >
-            開始轉錄
+            {files.length > 1 ? `開始轉錄 ${files.length} 個檔案` : '開始轉錄'}
           </Button>
         ) : (
           <Button
@@ -572,6 +684,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [recordKind, setRecordKind] = useState<'audio' | 'video' | null>(null)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const autoScrollRef = useRef(true)
+  const sseAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false)
@@ -583,6 +696,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       setRecordKind(j.record_kind || null)
     })
     const ctrl = new AbortController()
+    sseAbortRef.current = ctrl
     ;(async () => {
       try {
         const res = await fetch(`/api/jobs/${jobId}/events`, { signal: ctrl.signal })
@@ -635,13 +749,24 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [pendingAction, setPendingAction] = useState<'pause' | 'resume' | 'cancel' | null>(null)
   const action = async (a: 'pause' | 'resume' | 'cancel') => {
     setPendingAction(a)
-    if (a === 'cancel') onCancelPendingChange?.(true)
+    // For live jobs: stop syncing immediately and do NOT lock navigation.
+    // The user explicitly wants the task page unlocked the moment they press stop,
+    // and all backend↔frontend sync (SSE) terminated.
+    if (a === 'cancel' && live) {
+      sseAbortRef.current?.abort()
+      setStatus('cancelled')
+      setListening(false)
+    }
+    // For file jobs we still surface the (brief) cancel-pending state so the
+    // user knows the worker is winding down — but we no longer block the UI
+    // for live jobs.
+    if (a === 'cancel' && !live) onCancelPendingChange?.(true)
     try {
       await fetch(`/api/jobs/${jobId}/${a}`, { method: 'POST' })
       onChange()
     } finally {
       setPendingAction(null)
-      if (a === 'cancel') onCancelPendingChange?.(false)
+      if (a === 'cancel' && !live) onCancelPendingChange?.(false)
     }
   }
 

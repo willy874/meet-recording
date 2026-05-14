@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -146,6 +147,15 @@ def estimate_eta(duration_sec: float, model: str, device: str, compute: str) -> 
     return duration_sec * rtf
 
 
+def _copy_upload_sync(src, dst) -> None:
+    """Stream upload file → temp file. Runs in a worker thread so the event loop stays free."""
+    try:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+    finally:
+        dst.close()
+
+
 def probe_duration(path: str) -> Optional[float]:
     try:
         out = subprocess.check_output(
@@ -208,6 +218,20 @@ class Job:
 JOBS: dict[str, Job] = {}
 
 
+# Dedicated thread pool for long-lived worker I/O (readline on each subprocess
+# stdout + the final proc.wait()). The default asyncio executor is shared with
+# every other to_thread / run_in_executor caller — including FastAPI's sync
+# endpoint handlers — and is sized at `min(32, cpu_count() + 4)`. On a 4-core
+# box that's only 8 threads, which can be filled by ~4 concurrent live jobs
+# (each holding one thread on readline + occasional wait). Giving worker I/O
+# its own roomy pool lets a dozen+ live streams coexist with batch file jobs
+# without starving request handling.
+_WORKER_IO_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("MEET_WORKER_IO_THREADS", "64")),
+    thread_name_prefix="meet-worker-io",
+)
+
+
 def _emit(job: Job, event: dict) -> None:
     job.events.append(event)
     t = event.get("type")
@@ -229,7 +253,9 @@ def _emit_state(job: Job) -> None:
 
 
 async def _run_job(job: Job) -> None:
-    duration = probe_duration(job.file_path)
+    # probe_duration spawns ffprobe synchronously — push it off-loop so it
+    # never starves a parallel live job's SSE pump.
+    duration = await asyncio.to_thread(probe_duration, job.file_path)
     if duration is not None:
         _emit(job, {
             "type": "estimate",
@@ -269,7 +295,7 @@ async def _run_job(job: Job) -> None:
 
     try:
         while True:
-            line = await loop.run_in_executor(None, proc.stdout.readline)
+            line = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.stdout.readline)
             if not line:
                 break
             try:
@@ -286,7 +312,10 @@ async def _run_job(job: Job) -> None:
                 break
     finally:
         out_fh.close()
-        rc = proc.wait()
+        # `proc.wait()` is synchronous — running it on the event loop briefly
+        # freezes every other job's SSE pump while we wait for the worker to
+        # actually exit. Offload it.
+        rc = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.wait)
         # Cancellation already set status to "cancelled" — don't overwrite.
         if job.status not in ("cancelled", "error"):
             job.status = "done" if rc == 0 else "error"
@@ -334,7 +363,7 @@ async def _run_live_job(job: Job) -> None:
 
     try:
         while True:
-            line = await loop.run_in_executor(None, proc.stdout.readline)
+            line = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.stdout.readline)
             if not line:
                 break
             try:
@@ -351,7 +380,9 @@ async def _run_live_job(job: Job) -> None:
                 break
     finally:
         out_fh.close()
-        rc = proc.wait()
+        # See note above: never block the event loop on a sync wait — would
+        # starve a parallel file-conversion job's stdout reader.
+        rc = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.wait)
         if job.status not in ("cancelled", "error"):
             job.status = "done" if rc == 0 else "error"
             if rc != 0 and not job.error:
@@ -399,9 +430,9 @@ async def create_job(
     suffix = Path(file.filename).suffix or ".bin"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        shutil.copyfileobj(file.file, tmp)
-        tmp.flush()
-        tmp.close()
+        # Copy off the event loop so large uploads don't freeze in-flight SSE
+        # streams (e.g. a live OBS job already running in parallel).
+        await asyncio.to_thread(_copy_upload_sync, file.file, tmp)
     finally:
         await file.close()
 
@@ -435,6 +466,91 @@ def _normalize_listen_url(url: str) -> str:
     return url
 
 
+_LIVE_ACTIVE_STATUSES = {"queued", "running", "paused"}
+
+
+def _listen_endpoint(url: str) -> Optional[tuple[str, int]]:
+    """Extract a (host, port) tuple from a listen URL, ignoring scheme/query.
+
+    Returns None if no port can be parsed — those URLs are treated as
+    "non-port-bound" and skipped from collision checks.
+    """
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+        if port is None:
+            return None
+        # Normalize wildcard binds so 0.0.0.0:9999 and :::9999 collide with
+        # 127.0.0.1:9999 (they would in practice on the same machine).
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            host = "*"
+        return (host, port)
+    except (ValueError, ImportError):
+        return None
+
+
+def _conflicting_live_job(listen_url: str) -> Optional[Job]:
+    """Return an active live job already bound to the same listen endpoint, if any."""
+    endpoint = _listen_endpoint(listen_url)
+    if endpoint is None:
+        return None
+    for job in JOBS.values():
+        if not job.live or job.status not in _LIVE_ACTIVE_STATUSES:
+            continue
+        other = _listen_endpoint(job.listen_url or "")
+        if other is None:
+            continue
+        # Wildcard binds on the same port collide with any host on that port.
+        same_port = other[1] == endpoint[1]
+        same_host = other[0] == endpoint[0] or "*" in (other[0], endpoint[0])
+        if same_port and same_host:
+            return job
+    return None
+
+
+def _suggest_free_listen_url(base_url: str = DEFAULT_LIVE_LISTEN_URL, max_step: int = 200) -> str:
+    """Bump the port in `base_url` until it no longer collides with an active live job.
+
+    Pure logical check against in-memory JOBS — does not probe the OS, since
+    ffmpeg will surface a real bind error when the worker actually starts.
+    """
+    endpoint = _listen_endpoint(base_url)
+    if endpoint is None:
+        return base_url
+    host, port = endpoint
+    for offset in range(max_step):
+        candidate_port = port + offset
+        candidate = _replace_port(base_url, candidate_port)
+        if _conflicting_live_job(candidate) is None:
+            return candidate
+    return base_url
+
+
+def _replace_port(url: str, new_port: int) -> str:
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    netloc = f"{host}:{new_port}"
+    if parsed.username:
+        userinfo = parsed.username + (f":{parsed.password}" if parsed.password else "")
+        netloc = f"{userinfo}@{netloc}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+@app.get("/api/live/suggest")
+def suggest_listen_url(base: Optional[str] = None) -> dict:
+    """Return a listen URL whose port is not in use by any active live job.
+
+    Frontend calls this when opening the "OBS 直播" tab so that two streams
+    can coexist as long as they pick different ports.
+    """
+    base_url = _normalize_listen_url(base or DEFAULT_LIVE_LISTEN_URL)
+    suggested = _suggest_free_listen_url(base_url)
+    return {"listen_url": suggested, "based_on": base_url}
+
+
 @app.post("/api/live")
 async def create_live_job(
     listen_url: str = Form(DEFAULT_LIVE_LISTEN_URL),
@@ -448,6 +564,22 @@ async def create_live_job(
     record_format: str = Form("m4a"),
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
+    conflict = _conflicting_live_job(listen_url)
+    if conflict is not None:
+        suggested = _suggest_free_listen_url(listen_url)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "listen_port_in_use",
+                "message": (
+                    f"Listen endpoint already in use by an active live job "
+                    f"({conflict.id}: {conflict.filename}). Pick a different port."
+                ),
+                "conflict_job_id": conflict.id,
+                "conflict_listen_url": conflict.listen_url,
+                "suggested_listen_url": suggested,
+            },
+        )
     job_id = uuid.uuid4().hex[:12]
     job_dir = reserve_job_dir()
     record_path: Optional[str] = None
