@@ -680,6 +680,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [live, setLive] = useState<boolean>(false)
   const [listenUrl, setListenUrl] = useState<string | null>(null)
   const [listening, setListening] = useState<boolean>(false)
+  const [receiving, setReceiving] = useState<boolean>(false)
   const [recordPath, setRecordPath] = useState<string | null>(null)
   const [recordKind, setRecordKind] = useState<'audio' | 'video' | null>(null)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
@@ -687,7 +688,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const sseAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false)
+    setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false); setReceiving(false)
     fetch(`/api/jobs/${jobId}`).then((r) => r.json()).then((j) => {
       setFilename(j.filename || '')
       setLive(!!j.live)
@@ -717,6 +718,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
             if (ev.type === 'estimate') setEstimate(ev)
             else if (ev.type === 'info') setInfo(ev)
             else if (ev.type === 'listening') setListening(true)
+            else if (ev.type === 'receiving') setReceiving(true)
             else if (ev.type === 'segment') setSegments((prev) => [...prev, ev])
             else if (ev.type === 'state') {
               setStatus(ev.status)
@@ -885,7 +887,19 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       {live && (
         <Alert severity="info" icon={<VideocamIcon />}>
           🔴 直播模式 · 監聽：<code>{listenUrl}</code>{' '}
-          {listening ? '（已就緒，等待 OBS 連入或音訊…）' : '（啟動中，模型載入後會開始監聽）'}
+          {!isActive
+            ? status === 'error'
+              ? '（❌ 串流異常已結束）'
+              : status === 'cancelled'
+                ? '（🛑 已手動停止）'
+                : receiving
+                  ? '（🛑 OBS 已中斷，串流結束）'
+                  : '（已結束，未收到任何音訊）'
+            : receiving
+              ? '（🎧 已接收到 OBS 音訊串流）'
+              : listening
+                ? '（已就緒，等待 OBS 連入或音訊…）'
+                : '（啟動中，模型載入後會開始監聽）'}
           {recordPath && (
             <Box sx={{ mt: 0.5 }}>
               {recordKind === 'audio' ? '🎙️ 同步錄音' : '🎬 同步錄影'}：<code>{recordPath}</code>

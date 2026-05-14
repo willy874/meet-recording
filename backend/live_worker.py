@@ -178,6 +178,7 @@ def main():
 
     try:
         fd = _FFMPEG.stdout.fileno()
+        receiving_emitted = False
         while True:
             try:
                 data = os.read(fd, 8192)
@@ -185,6 +186,9 @@ def main():
                 break
             if not data:
                 break
+            if not receiving_emitted:
+                emit({"type": "receiving"})
+                receiving_emitted = True
             buf.extend(data)
             while len(buf) >= chunk_bytes:
                 t0 = chunk_index * chunk_seconds
