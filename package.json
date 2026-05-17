@@ -3,5 +3,13 @@
   "version": "1.0.0",
   "description": "把音訊／影片轉成逐字稿，或讓 OBS 推串流進來做**即時轉錄**。前端用瀏覽器看段落即時跳出來，CLI 提供一鍵啟動與機器可讀模式。",
   "author": "Willy",
-  "license": "ISC"
+  "license": "ISC",
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c green,cyan \"npm:dev:backend\" \"npm:dev:frontend\"",
+    "dev:backend": "cd backend && .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port ${MEET_BACKEND_PORT:-7001} --reload",
+    "dev:frontend": "cd frontend && npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
 }
