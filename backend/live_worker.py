@@ -15,11 +15,13 @@ terminates it. Started with ``start_new_session=True`` by the parent so
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 from typing import Optional
 
 import numpy as np
@@ -54,14 +56,39 @@ _FFMPEG: Optional[subprocess.Popen] = None
 
 
 def _terminate_ffmpeg() -> None:
+    """Wait for ffmpeg to finish, draining its stdout so it can flush output.
+
+    When main.py cancels a live job it does `killpg(SIGINT)` on the worker's
+    process group — that hits ffmpeg directly with one SIGINT, which is the
+    polite "Ctrl-C once" signal. We must NOT send a second SIGINT here:
+    ffmpeg interprets two SIGINTs as "force quit now" and skips writing the
+    trailer (moov atom for m4a/mp4), leaving a 28-byte unplayable file.
+    """
     global _FFMPEG
     if _FFMPEG and _FFMPEG.poll() is None:
         try:
-            _FFMPEG.terminate()
+            # Drain stdout in a background thread so ffmpeg's PCM pipe doesn't
+            # back up while it's finalizing the recording output. Otherwise
+            # ffmpeg blocks on write() to a full pipe and never writes the
+            # trailer before our wait() times out.
+            if _FFMPEG.stdout is not None:
+                def _drain():
+                    try:
+                        while _FFMPEG and _FFMPEG.stdout and _FFMPEG.stdout.read(8192):
+                            pass
+                    except Exception:
+                        pass
+                threading.Thread(target=_drain, daemon=True).start()
             try:
-                _FFMPEG.wait(2)
+                _FFMPEG.wait(5)
             except subprocess.TimeoutExpired:
-                _FFMPEG.kill()
+                # Last resort: ffmpeg didn't finalize in time, kill it. The
+                # recording will be truncated but that's better than hanging.
+                _FFMPEG.terminate()
+                try:
+                    _FFMPEG.wait(2)
+                except subprocess.TimeoutExpired:
+                    _FFMPEG.kill()
         except ProcessLookupError:
             pass
 
@@ -86,6 +113,10 @@ def main():
     chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
 
     signal.signal(signal.SIGTERM, _on_term)
+    # main.py cancels live jobs by sending SIGINT to the worker group so
+    # ffmpeg receives it directly and writes a clean trailer (moov atom for
+    # MP4/m4a). Handle it here as well so the worker shuts down promptly.
+    signal.signal(signal.SIGINT, _on_term)
 
     try:
         model = WhisperModel(model_size, device=device, compute_type=compute)
@@ -109,9 +140,33 @@ def main():
             elif ext == "wav":
                 ffmpeg_args += ["-map", "0:a:0", "-c:a", "pcm_s16le", record_path]
             else:  # m4a / aac / mp4 audio-only
-                ffmpeg_args += ["-map", "0:a:0", "-c:a", "copy", record_path]
+                # m4a (ipod muxer) only accepts AAC/ALAC. OBS' "Custom FFmpeg
+                # Output" defaults to MP2 in many mpegts presets, which fails
+                # stream-copy into m4a with rc=234 / EINVAL. Always transcode
+                # to AAC so the recording works regardless of OBS settings.
+                # Fragmented MP4 so the file stays playable if ffmpeg is
+                # killed mid-stream (otherwise the moov atom never lands).
+                ffmpeg_args += [
+                    "-map", "0:a:0", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    record_path,
+                ]
         else:
-            ffmpeg_args += ["-map", "0", "-c", "copy", record_path]
+            # mp4/m4v/mov containers don't accept arbitrary audio codecs (e.g.
+            # OBS' default MP2 in mpegts) → stream-copy fails with rc=234.
+            # Transcode audio to AAC for these, keep video as stream-copy.
+            # mkv/ts/mpegts accept anything → safe to copy everything.
+            vext = os.path.splitext(record_path)[1].lower().lstrip(".")
+            if vext in ("mp4", "m4v", "mov"):
+                # Fragmented MP4 — playable even if ffmpeg is killed before
+                # writing the trailing moov atom.
+                ffmpeg_args += [
+                    "-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    record_path,
+                ]
+            else:
+                ffmpeg_args += ["-map", "0", "-c", "copy", record_path]
     # Output 2: 16k mono PCM on stdout for whisper.
     ffmpeg_args += [
         "-map", "0:a:0",
@@ -123,9 +178,26 @@ def main():
     _FFMPEG = subprocess.Popen(
         ffmpeg_args,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
     )
+
+    # Drain ffmpeg's stderr in a background thread so we can surface the
+    # last few lines if it exits non-zero (e.g. rc=234 / EINVAL).
+    stderr_tail: "collections.deque[str]" = collections.deque(maxlen=20)
+
+    def _pump_stderr() -> None:
+        assert _FFMPEG and _FFMPEG.stderr
+        for raw in _FFMPEG.stderr:
+            try:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+            except Exception:
+                continue
+            if line:
+                stderr_tail.append(line)
+                emit({"type": "ffmpeg_log", "line": line})
+
+    threading.Thread(target=_pump_stderr, daemon=True).start()
 
     emit({
         "type": "listening",
@@ -202,7 +274,13 @@ def main():
 
         rc = _FFMPEG.wait()
         if rc not in (0, None):
-            emit({"type": "error", "message": f"ffmpeg exited rc={rc}"})
+            tail = "\n".join(stderr_tail)
+            emit({
+                "type": "error",
+                "message": f"ffmpeg exited rc={rc}" + (f"\n{tail}" if tail else ""),
+                "ffmpeg_stderr": tail,
+                "rc": rc,
+            })
             sys.exit(1)
         emit({"type": "done"})
     except Exception as exc:

@@ -762,7 +762,10 @@ def cancel_job(job_id: str) -> dict:
     if job.status in ("running", "paused"):
         if job.status == "paused":
             _signal_worker(job, signal.SIGCONT)
-        _signal_worker(job, signal.SIGTERM)
+        # SIGINT (not SIGTERM) so any ffmpeg child in the worker's process
+        # group flushes its trailer (moov atom for fragmented MP4/m4a)
+        # instead of dying abruptly with a half-written container.
+        _signal_worker(job, signal.SIGINT)
         job.status = "cancelled"
         _emit_state(job)
         # Block until the worker (and its ffmpeg child) actually exit. For live
