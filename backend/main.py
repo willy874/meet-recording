@@ -31,6 +31,79 @@ MODEL_SIZE = os.environ.get("WHISPER_MODEL", "medium")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
 
+# Selectable Whisper models, ordered small → large. Each job picks one; the
+# env default above is only the pre-selected value in the UI/CLI.
+#
+# `rtf` is the CPU-int8 real-time factor used for ETA — seconds of compute per
+# second of audio. `live_chunk` is the smallest live chunk that still keeps up,
+# and `live_viable` says whether live mode is achievable at all: a chunk must
+# transcribe faster than the next one arrives, so any model whose rtf exceeds
+# 1.0 falls further behind no matter how the chunk size is tuned.
+#
+# medium and large-v3 figures are measured on this machine (Apple Silicon, CPU
+# int8, beam_size=5, VAD on); the rest are scaled estimates.
+MODEL_CATALOG: dict[str, dict] = {
+    "tiny":     {"params": "39M",   "size": "75 MB",  "rtf": 0.08, "live_chunk": 4,  "live_viable": True,  "note": "最快，準度低"},
+    "base":     {"params": "74M",   "size": "145 MB", "rtf": 0.12, "live_chunk": 5,  "live_viable": True,  "note": "快，準度普通"},
+    "small":    {"params": "244M",  "size": "480 MB", "rtf": 0.25, "live_chunk": 8,  "live_viable": True,  "note": "速度與準度折衷"},
+    "medium":   {"params": "769M",  "size": "1.5 GB", "rtf": 0.6,  "live_chunk": 15, "live_viable": True,  "note": "預設，直播用這個"},
+    "large-v2": {"params": "1550M", "size": "2.9 GB", "rtf": 1.7,  "live_chunk": 20, "live_viable": False, "note": "高準度，僅適合轉檔案"},
+    "large-v3": {"params": "1550M", "size": "2.9 GB", "rtf": 1.9,  "live_chunk": 20, "live_viable": False, "note": "最準，僅適合轉檔案"},
+}
+
+
+def live_chunk_hint(model: str) -> int:
+    """Recommended minimum live chunk seconds for `model` (default 6)."""
+    return int(MODEL_CATALOG.get(model, {}).get("live_chunk", 6))
+
+
+def _hf_cache_root() -> Path:
+    """Where huggingface_hub stores snapshots, honouring HF_HOME / HF_HUB_CACHE."""
+    explicit = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if explicit:
+        return Path(explicit).expanduser()
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def model_is_cached(model: str) -> bool:
+    """True when the model weights are fully downloaded and ready to load.
+
+    huggingface_hub only links `model.bin` into a snapshot once the blob has
+    finished downloading — a partial fetch leaves a `*.incomplete` blob and no
+    symlink. So the presence of a resolvable, non-empty `model.bin` is exactly
+    the "ready, no download needed" signal we want to surface in the UI.
+    """
+    repo_dir = _hf_cache_root() / f"models--Systran--faster-whisper-{model}"
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    for snap in snapshots.iterdir():
+        try:
+            weights = snap / "model.bin"
+            if weights.exists() and weights.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def resolve_model(raw: Optional[str]) -> str:
+    """Validate a per-job model override, falling back to the configured default.
+
+    Unknown names are rejected rather than passed through: an unrecognised
+    model would otherwise only fail deep inside the worker, after the job has
+    already been created and the UI has switched to the detail view.
+    """
+    if raw is None or not raw.strip():
+        return MODEL_SIZE
+    name = raw.strip()
+    if name not in MODEL_CATALOG:
+        raise HTTPException(400, f"unknown model: {name}")
+    return name
+
 BACKEND_DIR = Path(__file__).resolve().parent
 WORKER_PATH = BACKEND_DIR / "worker.py"
 LIVE_WORKER_PATH = BACKEND_DIR / "live_worker.py"
@@ -150,14 +223,8 @@ app.add_middleware(
 )
 
 
-_RTF_BY_MODEL = {
-    "tiny": 0.08, "base": 0.12, "small": 0.25, "medium": 0.6,
-    "large-v1": 1.2, "large-v2": 1.3, "large-v3": 1.5,
-}
-
-
 def estimate_eta(duration_sec: float, model: str, device: str, compute: str) -> float:
-    rtf = _RTF_BY_MODEL.get(model, 0.6)
+    rtf = MODEL_CATALOG.get(model, {}).get("rtf", 0.6)
     if device == "cuda":
         rtf *= 0.15 if compute in ("float16", "float32") else 0.3
     return duration_sec * rtf
@@ -193,6 +260,7 @@ class Job:
     language: Optional[str]
     vad: bool
     beam_size: int
+    model: str = MODEL_SIZE
     status: str = "queued"   # queued | running | paused | done | error | cancelled
     created_at: float = field(default_factory=time.time)
     estimate: Optional[dict] = None
@@ -219,6 +287,7 @@ class Job:
             "status": self.status,
             "created_at": self.created_at,
             "language": self.language,
+            "model": self.model,
             "duration_seconds": (self.estimate or {}).get("duration_seconds"),
             "segment_count": len(self.segments),
             "progress": progress,
@@ -276,8 +345,8 @@ async def _run_job(job: Job) -> None:
         _emit(job, {
             "type": "estimate",
             "duration_seconds": duration,
-            "eta_seconds": estimate_eta(duration, MODEL_SIZE, DEVICE, COMPUTE_TYPE),
-            "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
+            "eta_seconds": estimate_eta(duration, job.model, DEVICE, COMPUTE_TYPE),
+            "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
         })
 
     python_bin = str(PYTHON_BIN) if PYTHON_BIN.exists() else sys.executable
@@ -297,7 +366,7 @@ async def _run_job(job: Job) -> None:
         "language": job.language,
         "vad": job.vad,
         "beam_size": job.beam_size,
-        "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
+        "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
     }
     proc.stdin.write(json.dumps(config) + "\n")
     proc.stdin.flush()
@@ -365,7 +434,7 @@ async def _run_live_job(job: Job) -> None:
         "chunk_seconds": job.chunk_seconds,
         "record_path": job.record_path,
         "record_kind": job.record_kind,
-        "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
+        "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
     }
     proc.stdin.write(json.dumps(config) + "\n")
     proc.stdin.flush()
@@ -411,8 +480,36 @@ def health() -> dict:
     return {
         "ok": True,
         "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
+        "models": list(MODEL_CATALOG),
         "outputs_dir": str(get_outputs_dir()),
         "default_live_listen_url": DEFAULT_LIVE_LISTEN_URL,
+    }
+
+
+@app.get("/api/models")
+def list_models() -> dict:
+    """Catalog of selectable models, flagged with whether weights are on disk.
+
+    `cached: false` means the first job using that model pays a one-off
+    download (medium ≈1.5 GB, large-v3 ≈3 GB) before any audio is processed.
+    """
+    return {
+        "default": MODEL_SIZE,
+        "device": DEVICE,
+        "compute": COMPUTE_TYPE,
+        "models": [
+            {
+                "id": name,
+                "params": meta["params"],
+                "size": meta["size"],
+                "note": meta["note"],
+                "rtf": meta["rtf"],
+                "live_chunk": meta["live_chunk"],
+                "live_viable": meta["live_viable"],
+                "cached": model_is_cached(name),
+            }
+            for name, meta in MODEL_CATALOG.items()
+        ],
     }
 
 
@@ -481,10 +578,13 @@ async def create_job(
     language: Optional[str] = Form(None),
     vad: bool = Form(True),
     beam_size: int = Form(5),
+    model: Optional[str] = Form(None),
     output_dir: Optional[str] = Form(None),
 ) -> dict:
     if not file.filename:
         raise HTTPException(400, "missing filename")
+
+    model_name = resolve_model(model)
 
     try:
         base_dir = resolve_job_base_dir(output_dir)
@@ -510,10 +610,11 @@ async def create_job(
         language=language,
         vad=vad,
         beam_size=beam_size,
+        model=model_name,
     )
     JOBS[job_id] = job
     asyncio.create_task(_run_job(job))
-    return {"id": job_id}
+    return {"id": job_id, "model": model_name}
 
 
 def _normalize_listen_url(url: str) -> str:
@@ -623,12 +724,14 @@ async def create_live_job(
     beam_size: int = Form(5),
     chunk_seconds: float = Form(6.0),
     label: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
     record: bool = Form(False),
     record_kind: str = Form("audio"),
     record_format: str = Form("m4a"),
     output_dir: Optional[str] = Form(None),
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
+    model_name = resolve_model(model)
     try:
         base_dir = resolve_job_base_dir(output_dir)
     except OSError as exc:
@@ -670,6 +773,7 @@ async def create_live_job(
         language=language,
         vad=vad,
         beam_size=beam_size,
+        model=model_name,
         live=True,
         listen_url=listen_url,
         chunk_seconds=chunk_seconds,
@@ -681,6 +785,7 @@ async def create_live_job(
     return {
         "id": job_id, "listen_url": listen_url, "chunk_seconds": chunk_seconds,
         "record_path": record_path, "record_kind": job.record_kind,
+        "model": model_name, "recommended_chunk_seconds": live_chunk_hint(model_name),
     }
 
 

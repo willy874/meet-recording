@@ -60,7 +60,7 @@ export PATH="$PWD:$PATH"          # 暫時；寫進 ~/.zshrc 永久
 # ln -sf "$PWD/meet-cli" /usr/local/bin/meet-cli
 ```
 
-**首次跑 Whisper 會下載模型**（預設 `medium`，約 1.5 GB），模型快取在 `~/.cache/huggingface/`。換 `WHISPER_MODEL` 重跑就會下載對應大小的模型。
+**首次跑 Whisper 會下載模型**（預設 `medium`，約 1.5 GB），模型快取在 `~/.cache/huggingface/`。模型可以**逐一任務選擇**——Web UI 的「模型」下拉選單、CLI 的 `--model`；沒指定就用 `WHISPER_MODEL`。哪些已經下載好了，UI 會直接標示，也可以打 `GET /api/models` 查。詳見 [選擇模型](#選擇模型)。
 
 ---
 
@@ -191,6 +191,40 @@ obs     ...  127.0.0.1:NNNNN->127.0.0.1:9999 (ESTABLISHED)
 
 ---
 
+## 選擇模型
+
+模型是**每個任務各自決定**的：Web UI「新轉錄」表單裡的「模型」下拉（檔案轉錄與 OBS 直播都有），CLI 用 `--model`。後端的 `WHISPER_MODEL` 只決定預設值。
+
+下拉選單會標示哪些模型還沒下載（含檔案大小）；選了沒下載的模型，任務開頭會先卡在下載，UI 會事先提醒。
+
+以下數字實測於 Apple Silicon、CPU + `int8`、`beam_size=5`、開 VAD、中文語音。`rtf` 是「處理 1 秒音訊要花幾秒」，**超過 1.0 就代表比實時還慢**：
+
+| 模型 | 大小 | rtf | 轉檔案 | 直播（`--live`） |
+|------|------|-----|--------|------------------|
+| `tiny` | 75 MB | ~0.08 | 最快，準度低 | ✅ chunk 4s 以上 |
+| `base` | 145 MB | ~0.12 | 快 | ✅ chunk 5s 以上 |
+| `small` | 480 MB | ~0.25 | 折衷 | ✅ chunk 8s 以上 |
+| `medium` | 1.5 GB | ~0.6 | **預設** | ✅ **chunk 15s 以上** |
+| `large-v2` | 2.9 GB | ~1.7 | 高準度 | ❌ 比實時慢 |
+| `large-v3` | 2.9 GB | ~1.9 | **最準** | ❌ 比實時慢 |
+
+**簡單講：直播用 `medium`，事後轉檔案用 `large-v3`。**
+
+### 直播的 chunk 秒數怎麼選
+
+每個 chunk 必須在下一個 chunk 到齊前轉完，所以關鍵比值是「處理時間 ÷ chunk 秒數」，得低於 1.0。chunk 太短會輸，因為每段都有固定成本（載入呼叫、VAD、prompt），攤在越少音訊上越不划算。`medium` 實測：
+
+| chunk 秒數 | 處理時間 | 比值 | 結果 |
+|------------|----------|------|------|
+| 6（原預設） | ~5.9s | 0.98 | ⚠️ 會落後 |
+| 10 | ~7.1s | 0.71 | 勉強 |
+| **15** | ~9.1s | 0.61 | ✅ 穩 |
+| 20 | ~11.4s | 0.57 | ✅ 穩，但延遲高 |
+
+代價是延遲：一段字幕最晚會在說完後一個 chunk 才出現。`medium` 用 **15 秒**最平衡。
+
+這招救不了 `rtf > 1.0` 的模型。運算量隨音訊長度等比成長，所以 `large-v3` 不管 chunk 設 6/10/15/20 秒，比值都落在 1.83–2.14——延遲只會越積越多，不會收斂。CLI 會印 warning，Web UI 會跳紅色提示並提供一鍵換回 `medium`。
+
 ## 同步保留影片檔（直播模式）
 
 勾「☑ 同步保留影片檔」後，後端用**單一 ffmpeg、雙 output** 完成：
@@ -236,6 +270,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `-l, --language CODE` | `zh-TW`／`zh-CN`／`zh`／`en`／`ja`／`ko` …／`auto`（預設 `zh-TW`） |
 | `--no-vad` | 關 VAD 靜音過濾 |
 | `--beam-size N` | beam search 大小（預設 5） |
+| `-m, --model NAME` | 這個任務用哪個模型：`tiny`／`base`／`small`／`medium`／`large-v2`／`large-v3`（預設沿用後端的 `WHISPER_MODEL`）。詳見 [選擇模型](#選擇模型) |
 | `-o, --output PATH` | 把終版逐字稿寫到指定文字檔 |
 | `--live` | 直播模式 |
 | `--listen-url URL` | 直播 listener URL（預設 `tcp://0.0.0.0:9999?listen=1`） |
@@ -254,7 +289,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 
 | 變數 | 預設 | 說明 |
 |------|------|------|
-| `WHISPER_MODEL` | `medium` | `tiny` / `base` / `small` / `medium` / `large-v3`；模型越大越準也越慢 |
+| `WHISPER_MODEL` | `medium` | **預設**模型；每個任務都可用 UI 的「模型」下拉或 CLI `--model` 個別覆寫 |
 | `WHISPER_DEVICE` | `cpu` | 有 NVIDIA GPU 可改 `cuda` |
 | `WHISPER_COMPUTE` | `int8` | CPU 用 `int8` 最快；CUDA 建議 `float16` |
 | `PORT` | `7001` | 後端 port |
@@ -276,10 +311,35 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 {
   "ok": true,
   "model": "medium", "device": "cpu", "compute": "int8",
+  "models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
   "outputs_dir": "/Users/you/code/meet/outputs",
   "default_live_listen_url": "tcp://0.0.0.0:9999?listen=1"
 }
 ```
+
+`model` 是**預設**模型；`models` 是可選清單。
+
+### `GET /api/models` — 模型清單
+
+```json
+{
+  "default": "medium", "device": "cpu", "compute": "int8",
+  "models": [
+    {
+      "id": "medium", "params": "769M", "size": "1.5 GB",
+      "note": "預設，直播用這個",
+      "rtf": 0.6, "live_chunk": 15, "live_viable": true, "cached": true
+    }
+  ]
+}
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `rtf` | 處理 1 秒音訊要花幾秒（CPU int8 實測／推估） |
+| `live_chunk` | 直播建議的最小 chunk 秒數 |
+| `live_viable` | `false` = 比實時慢，直播無解，只適合轉檔案 |
+| `cached` | 權重是否已下載完成（`false` 代表首次使用要先等下載） |
 
 ### `POST /api/jobs` — 建立檔案轉錄任務
 
@@ -291,8 +351,9 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `language` | string | （空）= `zh-TW` | `zh-TW`／`zh-CN`／`zh`／`en`／…／`auto`／空 |
 | `vad` | bool | `true` | VAD 靜音過濾 |
 | `beam_size` | int | `5` | beam search |
+| `model` | string | 後端 `WHISPER_MODEL` | 這個任務用的模型；不在 `/api/models` 清單內回 400 |
 
-回 `{"id": "<job_id>"}`。
+回 `{"id": "<job_id>", "model": "medium"}`。
 
 ### `POST /api/live` — 建立直播任務
 
@@ -305,11 +366,14 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `vad` | bool | `true` | |
 | `beam_size` | int | `5` | |
 | `chunk_seconds` | float | `6.0` | 滾動 chunk 秒數 |
+| `model` | string | 後端 `WHISPER_MODEL` | 這個任務用的模型；不在清單內回 400 |
 | `label` | string | — | 顯示標籤 |
 | `record` | bool | `false` | 是否同步保留影片檔 |
 | `record_format` | string | `mkv` | `mkv` / `mp4` / `ts` / `flv` / `mov` |
 
-回 `{"id": "...", "listen_url": "...", "chunk_seconds": ..., "record_path": "..."}`。
+回 `{"id": "...", "listen_url": "...", "chunk_seconds": ..., "record_path": "...", "model": "medium", "recommended_chunk_seconds": 15}`。
+
+`recommended_chunk_seconds` 是該模型建議的最小 chunk；送出的 `chunk_seconds` 比它小就代表可能追不上串流。
 
 ### `GET /api/jobs`、`GET /api/jobs/{id}`
 

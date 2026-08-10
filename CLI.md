@@ -38,6 +38,7 @@ inside the venv.
 | `-l, --language CODE`  | `zh-TW`     | Language code. Accepts `zh-TW`, `zh-CN`, `zh`, `en`, `ja`, `ko`, …, or `auto` for auto-detect. `zh-TW`/`zh-CN` map to Whisper `zh` plus a Traditional/Simplified `initial_prompt` that biases the output script. |
 | `--no-vad`             | off         | Disable Whisper VAD silence filtering.                       |
 | `--beam-size N`        | `5`         | Beam search width.                                           |
+| `-m, --model NAME`     | backend default (`medium`) | Whisper model for this job: `tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`. Per-job — it does not change the backend's default. Unknown names are rejected with HTTP 400. Weights download on first use and are cached in `~/.cache/huggingface/`. See **Model selection** below. |
 | `-o, --output PATH`    | none        | Write final concatenated transcript to a UTF-8 text file.    |
 | `--host HOST`          | `127.0.0.1` | Backend host. Overrides env `MEET_HOST`.                     |
 | `--port PORT`          | `7001`      | Backend port. Overrides env `MEET_PORT`.                     |
@@ -59,9 +60,50 @@ inside the venv.
 | `MEET_PORT`     | Default backend port (overridden by `--port`).      |
 | `MEET_OUTPUTS_DIR` | Backend transcript output directory (overridden by `--outputs-dir`). |
 | `MEET_LIVE_LISTEN_URL` | Default `--listen-url` for live mode.        |
-| `WHISPER_MODEL` | Read by the backend on startup (`tiny`…`large-v3`). |
+| `WHISPER_MODEL` | Backend's *default* model (`tiny`…`large-v3`), used when a job sends no `--model`. |
 | `WHISPER_DEVICE`| `cpu` or `cuda`.                                    |
 | `WHISPER_COMPUTE`| e.g. `int8`, `float16`.                            |
+
+## Model selection
+
+`--model` picks the model **per job**; the backend's `WHISPER_MODEL` only supplies
+the default. `GET /api/models` returns the machine-readable catalog, including
+whether each model's weights are already downloaded (`cached`).
+
+Measured on Apple Silicon, CPU + `int8`, `beam_size=5`, VAD on, Mandarin speech.
+`rtf` is seconds of compute per second of audio — **above 1.0 means slower than
+real time**:
+
+| Model      | Size    | rtf   | File transcription | Live (`--live`) |
+|------------|---------|-------|--------------------|-----------------|
+| `tiny`     | 75 MB   | ~0.08 | fastest, low accuracy | ✅ `--chunk-seconds 4`+ |
+| `base`     | 145 MB  | ~0.12 | fast               | ✅ `--chunk-seconds 5`+ |
+| `small`    | 480 MB  | ~0.25 | balanced           | ✅ `--chunk-seconds 8`+ |
+| `medium`   | 1.5 GB  | ~0.6  | default            | ✅ `--chunk-seconds 15`+ |
+| `large-v2` | 2.9 GB  | ~1.7  | high accuracy      | ❌ slower than real time |
+| `large-v3` | 2.9 GB  | ~1.9  | best accuracy      | ❌ slower than real time |
+
+### Why live mode has a floor on `--chunk-seconds`
+
+Each chunk must finish transcribing before the next one arrives, so the useful
+ratio is `chunk_processing_time / chunk_seconds` — it has to stay below 1.0.
+Short chunks lose because a fixed per-chunk cost (model invocation, VAD, prompt
+priming) is spread over less audio. Measured for `medium`:
+
+| `--chunk-seconds` | processing time | ratio | verdict |
+|-------------------|-----------------|-------|---------|
+| 6                 | ~5.9 s          | 0.98  | falls behind |
+| 10                | ~7.1 s          | 0.71  | tight |
+| 15                | ~9.1 s          | 0.61  | comfortable |
+| 20                | ~11.4 s         | 0.57  | comfortable |
+
+Raising `--chunk-seconds` costs latency: a segment appears at most one chunk
+after it was spoken. 15 s is the sweet spot for `medium`.
+
+This does **not** rescue a model with `rtf > 1.0`. Compute scales with audio
+length, so `large-v3` measures 1.83–2.14 at *every* chunk size — the lag just
+grows more slowly or more quickly, never shrinks. `meet-cli` prints a warning
+and the web UI shows a blocking notice when you pair `--live` with such a model.
 
 ## Behavior
 
@@ -79,7 +121,8 @@ The CLI does **not** keep a backend alive across invocations.
 
 ## Event schema
 
-Identical to the HTTP SSE schema. Five event types:
+Mirrors the HTTP SSE schema, plus `warning`, which the CLI emits locally
+(it never appears on the SSE stream). Six event types:
 
 ```jsonc
 // Sent once, before the model runs, only if ffprobe could read the file.
@@ -96,6 +139,11 @@ Identical to the HTTP SSE schema. Five event types:
 
 // Sent repeatedly, one per non-empty segment.
 { "type": "segment", "start": 0.0, "end": 3.2, "text": "…" }
+
+// Emitted by the CLI itself, before the job is created, when the requested
+// --model / --chunk-seconds combination is unlikely to keep up with a live
+// stream. Advisory only — the job is still created. Never sent over SSE.
+{ "type": "warning", "message": "model 'large-v3' runs slower than real time…" }
 
 // Terminal events — exactly one will be sent.
 { "type": "done" }
@@ -114,9 +162,11 @@ started listening:
 Live segments use a wall-clock-relative timestamp counted from the start of
 the listener (i.e. `start`/`end` are seconds since `listening`).
 
-ETA is `duration_seconds × RTF`, where RTF is a per-model heuristic
-(tiny≈0.08, base≈0.12, small≈0.25, medium≈0.6, large-v3≈1.5 on CPU+int8;
-roughly 0.15× of that on CUDA+float16). Expect ±50% error on cold runs.
+ETA is `duration_seconds × RTF`, where RTF comes from `MODEL_CATALOG` in
+`main.py` and is also exposed per model by `GET /api/models` (tiny≈0.08,
+base≈0.12, small≈0.25, medium≈0.6, large-v2≈1.7, large-v3≈1.9 on CPU+int8;
+roughly 0.15× of that on CUDA+float16). Expect ±50% error on cold runs, and
+note the ETA excludes a first-use model download.
 
 A more accurate live estimate is `eta_seconds × (1 - last_segment.end / duration_seconds)`.
 

@@ -41,6 +41,42 @@ BACKEND_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
 DEFAULT_WEB_PORT = int(os.environ.get("MEET_WEB_PORT", "7002"))
 
+# Mirrors MODEL_CATALOG in main.py — kept as a plain literal so `--help` and
+# argparse validation work without importing (and booting) the backend module.
+# (min live chunk seconds, live mode achievable at all on CPU)
+MODEL_CHOICES: dict[str, tuple[int, bool]] = {
+    "tiny": (4, True), "base": (5, True), "small": (8, True), "medium": (15, True),
+    "large-v2": (20, False), "large-v3": (20, False),
+}
+
+
+def chunk_advice(model: Optional[str], chunk_seconds: float) -> Optional[str]:
+    """Warn when the chosen model can't keep up with a live stream.
+
+    A chunk has to finish transcribing before the next one arrives. Compute
+    scales with audio length, so for a model slower than real time no chunk
+    size rescues live mode — it only changes how fast the lag accumulates.
+    Smaller models just need a chunk long enough to amortize per-chunk cost.
+    """
+    if not model:
+        return None
+    entry = MODEL_CHOICES.get(model)
+    if entry is None:
+        return None
+    recommended, viable = entry
+    if not viable:
+        return (
+            f"model '{model}' runs slower than real time on CPU — live transcription will "
+            f"fall progressively behind at any --chunk-seconds. Use 'medium' for --live, "
+            f"and save '{model}' for file transcription."
+        )
+    if chunk_seconds >= recommended:
+        return None
+    return (
+        f"model '{model}' with --chunk-seconds {chunk_seconds:g} may fall behind the stream; "
+        f"recommended: {recommended} seconds or more"
+    )
+
 
 def base_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
@@ -197,20 +233,24 @@ def wait_frontend_ready(proc: subprocess.Popen, port: int, console: Console, tim
 # ---------------------------------------------------------------------------
 
 
-def create_job(host: str, port: int, file_path: Path, language: Optional[str], vad: bool, beam_size: int) -> str:
+def create_job(host: str, port: int, file_path: Path, language: Optional[str], vad: bool,
+               beam_size: int, model: Optional[str] = None) -> str:
     url = f"{base_url(host, port)}/api/jobs"
     with file_path.open("rb") as fh:
         files = {"file": (file_path.name, fh, "application/octet-stream")}
         data: dict[str, str] = {"vad": "true" if vad else "false", "beam_size": str(beam_size)}
         if language:
             data["language"] = language
+        if model:
+            data["model"] = model
         r = httpx.post(url, files=files, data=data, timeout=120)
         r.raise_for_status()
         return r.json()["id"]
 
 
 def create_live_job(host: str, port: int, listen_url: str, language: Optional[str], vad: bool,
-                    beam_size: int, chunk_seconds: float, label: Optional[str]) -> dict:
+                    beam_size: int, chunk_seconds: float, label: Optional[str],
+                    model: Optional[str] = None) -> dict:
     url = f"{base_url(host, port)}/api/live"
     data: dict[str, str] = {
         "listen_url": listen_url,
@@ -222,6 +262,8 @@ def create_live_job(host: str, port: int, listen_url: str, language: Optional[st
         data["language"] = language
     if label:
         data["label"] = label
+    if model:
+        data["model"] = model
     r = httpx.post(url, data=data, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -608,14 +650,23 @@ def run_human(args, host: str, port: int) -> int:
         if args.open:
             _open_browser(web_url, console)
 
+    # Live jobs have no duration to probe, so they never emit an `estimate`
+    # event — the panel's Model row would stay blank. Take it from the create
+    # response instead, which reports the model the backend actually resolved.
+    live_model: Optional[str] = None
     if args.live:
+        advice = chunk_advice(args.model, args.chunk_seconds)
+        if advice:
+            console.print(f"[yellow]warning:[/yellow] {advice}")
         try:
             resp = create_live_job(
                 host, port, args.listen_url,
                 None if args.language == "auto" else args.language,
                 not args.no_vad, args.beam_size, args.chunk_seconds, args.label,
+                args.model,
             )
             job_id = resp["id"]
+            live_model = resp.get("model")
         except httpx.HTTPError as e:
             console.print(f"[red]failed to create live job: {e}[/red]")
             cleanup_servers()
@@ -630,7 +681,8 @@ def run_human(args, host: str, port: int) -> int:
             return 2
 
         try:
-            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language, not args.no_vad, args.beam_size)
+            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language,
+                                not args.no_vad, args.beam_size, args.model)
         except httpx.HTTPError as e:
             console.print(f"[red]failed to create job: {e}[/red]")
             cleanup_servers()
@@ -656,6 +708,8 @@ def run_human(args, host: str, port: int) -> int:
         if estimate:
             head.add_row("Audio", f"{fmt_duration(estimate['duration_seconds'])} · est ~{fmt_duration(estimate['eta_seconds'])}")
             head.add_row("Model", f"{estimate['model']} · {estimate['device']} · {estimate['compute']}")
+        elif live_model:
+            head.add_row("Model", f"{live_model} · chunk {args.chunk_seconds:g}s")
         if info:
             head.add_row("Language", f"{info['language']} ({info['language_probability'] * 100:.0f}%)")
         head.add_row("Segments", str(len(segments)))
@@ -781,11 +835,15 @@ def run_json(args, host: str, port: int) -> int:
             _open_browser(web_url, console)
 
     if args.live:
+        advice = chunk_advice(args.model, args.chunk_seconds)
+        if advice:
+            print(json.dumps({"type": "warning", "message": advice}), flush=True)
         try:
             resp = create_live_job(
                 host, port, args.listen_url,
                 None if args.language == "auto" else args.language,
                 not args.no_vad, args.beam_size, args.chunk_seconds, args.label,
+                args.model,
             )
             job_id = resp["id"]
         except httpx.HTTPError as e:
@@ -804,7 +862,8 @@ def run_json(args, host: str, port: int) -> int:
             return 2
 
         try:
-            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language, not args.no_vad, args.beam_size)
+            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language,
+                                not args.no_vad, args.beam_size, args.model)
         except httpx.HTTPError as e:
             print(json.dumps({"type": "error", "message": str(e)}))
             for p in reversed(children):
@@ -855,6 +914,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Language code (default: zh-TW). Accepts: zh-TW, zh-CN, zh, en, ja, ko, … or 'auto'.")
     p.add_argument("--no-vad", action="store_true", help="Disable VAD silence filtering")
     p.add_argument("--beam-size", type=int, default=5, help="Beam search size (default 5)")
+    p.add_argument("-m", "--model", default=None, choices=list(MODEL_CHOICES),
+                   help="Whisper model for this job (default: backend's WHISPER_MODEL, normally medium). "
+                        "Larger = more accurate but slower; for --live see --chunk-seconds.")
     p.add_argument("-o", "--output", default=None, help="Write final transcript to this file (text)")
     p.add_argument("--host", default=DEFAULT_HOST, help=f"Backend host (default {DEFAULT_HOST})")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Backend port (default {DEFAULT_PORT})")
@@ -913,6 +975,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # We just picked a free port — there is by definition no backend there
         # yet, so attaching is impossible; force autostart.
         args.no_autostart = False
+    if args.model:
+        # Seed the backend's default model too, not just this job's. Without
+        # this, `--serve --model X` would silently do nothing (serve mode
+        # creates no job to attach the model to) and the web UI would still
+        # pre-select whatever the environment's WHISPER_MODEL says. Merged
+        # rather than assigned so isolated mode's MEET_CONFIG_DIR survives.
+        # Like --outputs-dir, this only applies to a backend we start
+        # ourselves — attaching to a running one leaves its default alone.
+        extra = getattr(args, "_extra_backend_env", None) or {}
+        extra["WHISPER_MODEL"] = args.model
+        args._extra_backend_env = extra
     if args.serve:
         # Default to also bringing up the web UI in serve mode — that's the whole point.
         args.web = True

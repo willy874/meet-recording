@@ -30,6 +30,11 @@ type JobSummary = {
   language: string | null; duration_seconds: number | null; segment_count: number;
   progress: number; error: string | null;
   live?: boolean; listen_url?: string | null;
+  model?: string;
+}
+type ModelInfo = {
+  id: string; params: string; size: string; note: string;
+  rtf: number; live_chunk: number; live_viable: boolean; cached: boolean
 }
 
 const formatTs = (s: number) => {
@@ -386,6 +391,7 @@ const NEWJOB_PREFS_KEY = 'meet.newjob.prefs.v1'
 type NewJobPrefs = {
   mode: 'file' | 'live'
   language: string
+  model: string
   vad: boolean
   listenUrl: string
   chunkSeconds: number
@@ -399,6 +405,10 @@ type NewJobPrefs = {
 const NEWJOB_DEFAULTS: NewJobPrefs = {
   mode: 'file',
   language: 'auto',
+  // Empty = "whatever the backend reports as default"; filled in once
+  // /api/models resolves, so we never hard-code a model the backend may
+  // have overridden via WHISPER_MODEL.
+  model: '',
   vad: true,
   listenUrl: 'tcp://0.0.0.0:9999?listen=1',
   chunkSeconds: 6,
@@ -428,6 +438,8 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const [files, setFiles] = useState<File[]>([])
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
   const [language, setLanguage] = useState(initial.language)
+  const [model, setModel] = useState(initial.model)
+  const [models, setModels] = useState<ModelInfo[]>([])
   const [vad, setVad] = useState(initial.vad)
   const [listenUrl, setListenUrl] = useState(initial.listenUrl)
   const [chunkSeconds, setChunkSeconds] = useState(initial.chunkSeconds)
@@ -440,6 +452,23 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const [pickingOutputDir, setPickingOutputDir] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Model catalog is backend-owned (it knows which weights are on disk and
+  // what the configured default is), so fetch rather than hard-code it.
+  useEffect(() => {
+    const ctrl = new AbortController()
+    ;(async () => {
+      try {
+        const r = await fetch('/api/models', { signal: ctrl.signal })
+        if (!r.ok) return
+        const data = await r.json()
+        setModels(data.models ?? [])
+        // Only adopt the backend default when the user has no stored choice.
+        setModel((cur) => cur || (data.default as string) || '')
+      } catch { /* offline backend — the Select just stays empty */ }
+    })()
+    return () => ctrl.abort()
+  }, [])
 
   const pickOutputDir = async () => {
     setPickingOutputDir(true)
@@ -481,12 +510,22 @@ function NewJob({ onCreated, defaultOutputsDir }: {
 
   const persistPrefs = () => {
     const prefs: NewJobPrefs = {
-      mode, language, vad, listenUrl, chunkSeconds, label,
+      mode, language, model, vad, listenUrl, chunkSeconds, label,
       record, recordKind, recordAudioFormat, recordVideoFormat,
       outputDir,
     }
     try { localStorage.setItem(NEWJOB_PREFS_KEY, JSON.stringify(prefs)) } catch { /* ignore quota */ }
   }
+
+  const selectedModel = models.find((m) => m.id === model) ?? null
+  // A chunk must finish transcribing before the next one arrives. Models
+  // slower than real time can't win that race at any chunk size, so they get
+  // a hard warning; the rest just need a chunk long enough to amortize their
+  // per-chunk cost, which we offer to apply in one click.
+  const liveTooSlow = mode === 'live' && selectedModel !== null && !selectedModel.live_viable
+  const chunkTooShort = mode === 'live' && selectedModel !== null
+    && selectedModel.live_viable && chunkSeconds < selectedModel.live_chunk
+  const fasterLiveModel = models.find((m) => m.live_viable && m.cached)?.id ?? 'medium'
 
   const handleStartFile = async () => {
     if (files.length === 0 || submitting) return
@@ -500,6 +539,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
       const form = new FormData()
       form.append('file', f)
       if (language) form.append('language', language)
+      if (model) form.append('model', model)
       form.append('vad', vad ? 'true' : 'false')
       if (outputDir.trim()) form.append('output_dir', outputDir.trim())
       try {
@@ -531,6 +571,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
     const form = new FormData()
     form.append('listen_url', listenUrl)
     if (language) form.append('language', language)
+    if (model) form.append('model', model)
     form.append('vad', vad ? 'true' : 'false')
     form.append('chunk_seconds', String(chunkSeconds))
     if (label) form.append('label', label)
@@ -670,10 +711,46 @@ function NewJob({ onCreated, defaultOutputsDir }: {
                 type="number"
                 value={chunkSeconds}
                 onChange={(e) => setChunkSeconds(Number(e.target.value) || 6)}
-                slotProps={{ htmlInput: { min: 2, max: 30 } }}
+                slotProps={{ htmlInput: { min: 2, max: 60 } }}
                 sx={{ width: 140 }}
               />
             </Stack>
+            {liveTooSlow && selectedModel && (
+              <Alert
+                severity="error"
+                variant="outlined"
+                action={
+                  <Button size="small" color="inherit" onClick={() => setModel(fasterLiveModel)}>
+                    改用 {fasterLiveModel}
+                  </Button>
+                }
+              >
+                <Typography variant="body2">
+                  <strong>{selectedModel.id}</strong> 在 CPU 上約需 {selectedModel.rtf}× 實時
+                  （轉 1 秒音訊要花 {selectedModel.rtf} 秒），比串流進來的速度還慢——
+                  <strong>不論 chunk 秒數設多少都會愈落後愈多</strong>，直到記憶體被待處理音訊塞爆。
+                  直播請用 <strong>{fasterLiveModel}</strong>；{selectedModel.id} 留給事後轉檔案。
+                </Typography>
+              </Alert>
+            )}
+            {chunkTooShort && selectedModel && (
+              <Alert
+                severity="warning"
+                variant="outlined"
+                action={
+                  <Button size="small" onClick={() => setChunkSeconds(selectedModel.live_chunk)}>
+                    改成 {selectedModel.live_chunk}s
+                  </Button>
+                }
+              >
+                <Typography variant="body2">
+                  <strong>{selectedModel.id}</strong> 在 CPU 上轉一段 {chunkSeconds}s 的音訊，
+                  所需時間可能超過 {chunkSeconds}s —— 逐字稿會愈落後愈多。
+                  建議 chunk 秒數設為 <strong>{selectedModel.live_chunk}s</strong> 以上
+                  （代價是每段字幕最多延遲 {selectedModel.live_chunk} 秒才出現）。
+                </Typography>
+              </Alert>
+            )}
             <FormControlLabel
               control={
                 <Checkbox checked={record} onChange={(e) => setRecord(e.target.checked)} />
@@ -756,7 +833,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
           </Stack>
         </Stack>
 
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ mb: 3 }}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ mb: 1.5 }}>
           <FormControl size="small" sx={{ minWidth: 180 }}>
             <InputLabel>語言</InputLabel>
             <Select label="語言" value={language} onChange={(e) => setLanguage(e.target.value)}>
@@ -768,11 +845,31 @@ function NewJob({ onCreated, defaultOutputsDir }: {
               <MenuItem value="auto">自動偵測</MenuItem>
             </Select>
           </FormControl>
+          <FormControl size="small" sx={{ minWidth: 260 }} disabled={models.length === 0}>
+            <InputLabel>模型</InputLabel>
+            <Select label="模型" value={models.length ? model : ''} onChange={(e) => setModel(e.target.value)}>
+              {models.map((m) => (
+                <MenuItem key={m.id} value={m.id}>
+                  {m.id} · {m.note}{m.cached ? '' : `（未下載 ${m.size}）`}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <FormControlLabel
             control={<Checkbox checked={vad} onChange={(e) => setVad(e.target.checked)} />}
             label="VAD（過濾靜音）"
           />
         </Stack>
+
+        {selectedModel && !selectedModel.cached && (
+          <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+            <Typography variant="body2">
+              第一次使用 <strong>{selectedModel.id}</strong> 會先下載約 {selectedModel.size} 的權重，
+              這段期間任務會停在開頭不動，屬正常現象。下載完成後就會快取起來，之後不用再等。
+            </Typography>
+          </Alert>
+        )}
+        {selectedModel?.cached && <Box sx={{ mb: 1.5 }} />}
 
         {mode === 'file' ? (
           <Button
