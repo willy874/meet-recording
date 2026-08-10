@@ -46,7 +46,7 @@ inside the venv.
 | `--json`               | off         | Emit line-delimited JSON events on stdout (no TUI).          |
 | `--live`               | off         | Live mode: backend acts as an ffmpeg listener and transcribes a stream (e.g. OBS) in real time. The `file` argument is ignored. |
 | `--listen-url URL`     | `tcp://0.0.0.0:9999?listen=1` | Live mode: ffmpeg input URL. Supports any URL ffmpeg accepts as a listener (TCP/UDP MPEG-TS, SRT, …). Override via `MEET_LIVE_LISTEN_URL`. |
-| `--chunk-seconds N`    | `6`         | Live mode: rolling PCM chunk size fed to Whisper. Smaller = lower latency, more boundary errors. |
+| `--chunk-seconds N`    | `15`        | Live mode: rolling PCM chunk size fed to Whisper. Smaller = lower latency, more boundary errors. |
 | `--label TEXT`         | none        | Live mode: display label for the job in the frontend.        |
 | `--serve`              | off         | Servers-only mode: start backend (and frontend) and let the web UI drive everything. No `file`, `--live`, or upload from CLI; the CLI just keeps the servers alive until Ctrl-C. |
 | `--outputs-dir DIR`    | `<repo>/outputs` | Directory the backend writes transcript outputs into. Sets `MEET_OUTPUTS_DIR` for the spawned backend. Only takes effect when this CLI starts the backend itself (not when attaching to a pre-running one). |
@@ -156,7 +156,7 @@ started listening:
 
 ```jsonc
 { "type": "listening", "url": "tcp://0.0.0.0:9999?listen=1",
-  "chunk_seconds": 6.0, "sample_rate": 16000 }
+  "chunk_seconds": 15.0, "sample_rate": 16000 }
 ```
 
 Live segments use a wall-clock-relative timestamp counted from the start of

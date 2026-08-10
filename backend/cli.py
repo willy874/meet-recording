@@ -907,8 +907,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Live mode: receive an OBS/ffmpeg stream and transcribe in real time")
     p.add_argument("--listen-url", default=os.environ.get("MEET_LIVE_LISTEN_URL", "tcp://0.0.0.0:9999?listen=1"),
                    help="Live mode listen URL passed to ffmpeg (default tcp://0.0.0.0:9999?listen=1)")
-    p.add_argument("--chunk-seconds", type=float, default=6.0,
-                   help="Live mode rolling chunk size in seconds (default 6)")
+    p.add_argument("--chunk-seconds", type=float, default=15.0,
+                   help="Live mode rolling chunk size in seconds (default 15)")
     p.add_argument("--label", default=None, help="Live mode display label for the job")
     p.add_argument("-l", "--language", default="zh-TW",
                    help="Language code (default: zh-TW). Accepts: zh-TW, zh-CN, zh, en, ja, ko, … or 'auto'.")

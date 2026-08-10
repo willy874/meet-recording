@@ -129,7 +129,7 @@ Production build：`npm run build`，產物在 `frontend/dist/`。
 
 1. 「+ 新轉錄」→ 切到「**OBS 直播**」分頁
 2. 「監聽 URL」維持預設 `tcp://0.0.0.0:9999?listen=1`（後端會自動補 `?listen=1`，少打也沒關係）
-3. 語言、chunk 秒數（預設 6）、視需要勾「**☑ 同步保留影片檔**」並選格式
+3. 語言、chunk 秒數（預設 15）、視需要勾「**☑ 同步保留影片檔**」並選格式
 4. 按「**開始監聽**」
 5. 任務出現在左欄，看到 `🔴 直播模式 · 已就緒` 就是 ffmpeg 已 listen 在 9999
 
@@ -274,7 +274,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `-o, --output PATH` | 把終版逐字稿寫到指定文字檔 |
 | `--live` | 直播模式 |
 | `--listen-url URL` | 直播 listener URL（預設 `tcp://0.0.0.0:9999?listen=1`） |
-| `--chunk-seconds N` | 直播 chunk 秒數（預設 6） |
+| `--chunk-seconds N` | 直播 chunk 秒數（預設 15） |
 | `--label TEXT` | 直播任務在側欄顯示的標籤 |
 | `--serve` | servers-only；不建任何 job，由 Web UI 控制 |
 | `--outputs-dir DIR` | 後端逐字稿／錄影輸出目錄（注入 `MEET_OUTPUTS_DIR`） |
@@ -340,6 +340,22 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `live_chunk` | 直播建議的最小 chunk 秒數 |
 | `live_viable` | `false` = 比實時慢，直播無解，只適合轉檔案 |
 | `cached` | 權重是否已下載完成（`false` 代表首次使用要先等下載） |
+| `disk_bytes` | 目前佔用的本機空間（含取消下載留下的殘檔） |
+| `downloading` / `download_progress` | 是否正在下載、進度 0–1 |
+| `downloaded_bytes` / `download_total_bytes` | 下載中的即時位元組數（來自 worker 的 tqdm 回報） |
+| `download_error` | 上次下載失敗的原因，成功或未下載時為 `null` |
+| `in_use` | 是否有 queued/running/paused 的任務綁在這個模型上（此時不能卸載） |
+
+### 模型下載 / 卸載
+
+| 端點 | 說明 |
+|------|------|
+| `POST /api/models/{model}/download` | 背景下載權重；已下載直接回 `{"status": "done"}`，重複呼叫回 409 |
+| `POST /api/models/{model}/download/cancel` | 中止下載；已下載的部分留著，下次下載會續傳 |
+| `DELETE /api/models/{model}` | 刪除本機權重，回 `{"freed_bytes": N}`；下載中或有任務在用回 409 |
+
+下載跑在 `download_worker.py` 子程序（可被 signal 中止），進度由 huggingface_hub 的 tqdm hook
+以 NDJSON 回報給後端。Web UI 在「模型」下拉選單旁的 **模型管理** 按鈕裡操作。
 
 ### `POST /api/jobs` — 建立檔案轉錄任務
 
@@ -365,7 +381,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `language` | string | （同上） | |
 | `vad` | bool | `true` | |
 | `beam_size` | int | `5` | |
-| `chunk_seconds` | float | `6.0` | 滾動 chunk 秒數 |
+| `chunk_seconds` | float | `15.0` | 滾動 chunk 秒數 |
 | `model` | string | 後端 `WHISPER_MODEL` | 這個任務用的模型；不在清單內回 400 |
 | `label` | string | — | 顯示標籤 |
 | `record` | bool | `false` | 是否同步保留影片檔 |
@@ -390,7 +406,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 
 // 直播模式才有：模型載入完、ffmpeg 已 listen
 { "type": "listening", "url": "tcp://0.0.0.0:9999?listen=1",
-  "chunk_seconds": 6.0, "sample_rate": 16000, "record_path": null }
+  "chunk_seconds": 15.0, "sample_rate": 16000, "record_path": null }
 
 // 模型分析音訊 header 之後
 { "type": "info", "language": "zh", "language_probability": 0.99, "duration": 754.3 }
@@ -428,7 +444,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `Couldn't open 'tcp://127.0.0.1:9999', Connection refused` | meet 還沒按「開始監聽」，listener 不在；先建任務再開 OBS |
 | meet 任務直接 `error: ffmpeg exited rc=195` | meet 的監聽 URL 少了 `?listen=1`（後端已自動補；若還出現代表 URL 用了不能 listen 的協定，例如 SRT 沒 libsrt） |
 | 直播段落都是空的或亂碼 | 麥克風沒進 OBS／視訊軌道沒勾／音訊位元率太低；用 OBS 內建「監聽」確認來源有聲音 |
-| 段落邊界切到字 | `chunk_seconds` 過小（建議 5–10）；太短反而碎 |
+| 段落邊界切到字 | `chunk_seconds` 過小（`medium` 建議 15 以上）；太短反而碎 |
 | `outputs/` 沒看到檔案 | CLI 沒帶 `--outputs-dir` 或後端是別人起的；`/api/health` 看 `outputs_dir` 真實位置 |
 | 想知道 OBS 有沒有「同時錄到本地」 | `pgrep -lf obs-ffmpeg-mux`；自訂 FFmpeg 「輸出到 URL」模式下不會跑 mux 程序、不會有本地檔 |
 | Whisper 模型下載慢／斷 | 改小模型試（`WHISPER_MODEL=small`），或先手動 `huggingface-cli` 下載 |
@@ -445,6 +461,7 @@ meet/
 │   ├── main.py           FastAPI app（/api/health、/api/jobs、/api/live、SSE）
 │   ├── worker.py         檔案轉錄子程序（NDJSON on stdout）
 │   ├── live_worker.py    直播子程序：spawn ffmpeg listener、滾動 chunk → whisper、可同步寫影片檔
+│   ├── download_worker.py 模型下載子程序（snapshot_download + tqdm 進度 → NDJSON）
 │   ├── cli.py            CLI 進入點（rich TUI、JSON、--serve、--live、--open）
 │   ├── meet-cli          bash wrapper，自動找 .venv 與 cli.py
 │   ├── requirements.txt

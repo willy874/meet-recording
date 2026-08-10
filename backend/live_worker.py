@@ -107,7 +107,7 @@ def main():
     model_size = config.get("model", "medium")
     device = config.get("device", "cpu")
     compute = config.get("compute", "int8")
-    chunk_seconds = float(config.get("chunk_seconds", 6.0))
+    chunk_seconds = float(config.get("chunk_seconds", 15.0))
     record_path = config.get("record_path")  # optional path to mux a copy of the stream
     record_kind = config.get("record_kind", "video")  # "video" (stream-copy all) | "audio" (audio only)
     chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)

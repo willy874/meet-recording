@@ -4,7 +4,7 @@ import {
   Button, IconButton, TextField, MenuItem, Select, FormControlLabel, Checkbox,
   Tabs, Tab, Chip, List, ListItem, ListItemButton, ListItemText, LinearProgress,
   Alert, Tooltip, InputLabel, FormControl, useColorScheme, Divider, Snackbar,
-  ToggleButton, ToggleButtonGroup,
+  ToggleButton, ToggleButtonGroup, Dialog, DialogTitle, DialogContent, DialogActions,
 } from '@mui/material'
 import AddIcon from '@mui/icons-material/Add'
 import RefreshIcon from '@mui/icons-material/Refresh'
@@ -16,6 +16,8 @@ import DownloadIcon from '@mui/icons-material/Download'
 import VideocamIcon from '@mui/icons-material/Videocam'
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutlineOutlined'
+import FolderOpenIcon from '@mui/icons-material/FolderOpen'
+import StorageIcon from '@mui/icons-material/Storage'
 import LightModeIcon from '@mui/icons-material/LightMode'
 import DarkModeIcon from '@mui/icons-material/DarkMode'
 import SettingsBrightnessIcon from '@mui/icons-material/SettingsBrightness'
@@ -34,13 +36,33 @@ type JobSummary = {
 }
 type ModelInfo = {
   id: string; params: string; size: string; note: string;
-  rtf: number; live_chunk: number; live_viable: boolean; cached: boolean
+  rtf: number; live_chunk: number; live_viable: boolean; cached: boolean;
+  disk_bytes: number; downloading: boolean;
+  downloaded_bytes: number; download_total_bytes: number;
+  download_progress: number; download_error: string | null; in_use: boolean;
 }
 
 const formatTs = (s: number) => {
   const m = Math.floor(s / 60)
   const sec = (s % 60).toFixed(1).padStart(4, '0')
   return `${m.toString().padStart(2, '0')}:${sec}`
+}
+
+const formatBytes = (b: number) => {
+  if (!b) return '0 MB'
+  const mb = b / 1024 ** 2
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`
+}
+
+/** Ask the backend to pop this folder open in Finder/Explorer on the host machine. */
+const revealFolder = async (path: string) => {
+  const r = await fetch('/api/reveal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
 }
 
 const formatDuration = (s: number) => {
@@ -177,6 +199,20 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
+  const [opening, setOpening] = useState(false)
+
+  const openFolder = async () => {
+    if (!value) return
+    setError(null)
+    setOpening(true)
+    try {
+      await revealFolder(value)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setOpening(false)
+    }
+  }
 
   const startEdit = () => { setDraft(value ?? ''); setError(null); setEditing(true) }
   const cancel = () => { setEditing(false); setError(null) }
@@ -255,13 +291,47 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
             </>
           ) : (
             <>
-              <Typography
-                variant="body2"
-                sx={{ flex: 1, fontFamily: 'ui-monospace, monospace', fontSize: 13, wordBreak: 'break-all' }}
-              >
-                {value || '（載入中…）'}
-              </Typography>
+              <Tooltip title={value ? '點擊在檔案總管／Finder 開啟這個資料夾' : ''}>
+                <Typography
+                  component="button"
+                  type="button"
+                  variant="body2"
+                  onClick={openFolder}
+                  disabled={!value || opening}
+                  sx={{
+                    flex: 1,
+                    textAlign: 'left',
+                    fontFamily: 'ui-monospace, monospace',
+                    fontSize: 13,
+                    wordBreak: 'break-all',
+                    border: 0,
+                    p: 0,
+                    bgcolor: 'transparent',
+                    color: 'primary.main',
+                    cursor: value ? 'pointer' : 'default',
+                    textDecoration: 'underline',
+                    textDecorationStyle: 'dotted',
+                    textUnderlineOffset: 3,
+                    '&:hover': { textDecorationStyle: 'solid' },
+                    '&:disabled': { color: 'text.secondary', textDecoration: 'none' },
+                  }}
+                >
+                  {value || '（載入中…）'}
+                </Typography>
+              </Tooltip>
               <Stack direction="row" spacing={1}>
+                <Tooltip title="在檔案總管／Finder 開啟">
+                  <span>
+                    <Button
+                      size="small"
+                      startIcon={<FolderOpenIcon />}
+                      onClick={openFolder}
+                      disabled={!value || opening}
+                    >
+                      開啟
+                    </Button>
+                  </span>
+                </Tooltip>
                 <Tooltip title="開啟本機原生資料夾選擇對話框">
                   <span>
                     <Button size="small" onClick={pickFolder} disabled={!value || picking}>
@@ -388,6 +458,14 @@ function Sidebar({ jobs, selected, onSelect, onRefresh, onDeleted }: {
 }
 
 const NEWJOB_PREFS_KEY = 'meet.newjob.prefs.v1'
+// Bumped whenever a *default* changes in a way stored prefs should adopt.
+// Prefs saved under an older rev get the changed fields reset (see
+// loadNewJobPrefs) — otherwise every returning browser keeps the old default
+// forever, since prefs are re-saved on each job.
+const NEWJOB_PREFS_REV = 2
+// Live chunk size. 15s matches the `medium` model's recommended minimum, so
+// the default combo keeps up with the stream out of the box.
+const DEFAULT_CHUNK_SECONDS = 15
 type NewJobPrefs = {
   mode: 'file' | 'live'
   language: string
@@ -401,6 +479,7 @@ type NewJobPrefs = {
   recordAudioFormat: 'm4a' | 'mp3' | 'wav'
   recordVideoFormat: 'mkv' | 'mp4' | 'ts'
   outputDir: string
+  rev?: number
 }
 const NEWJOB_DEFAULTS: NewJobPrefs = {
   mode: 'file',
@@ -411,22 +490,183 @@ const NEWJOB_DEFAULTS: NewJobPrefs = {
   model: '',
   vad: true,
   listenUrl: 'tcp://0.0.0.0:9999?listen=1',
-  chunkSeconds: 6,
+  chunkSeconds: DEFAULT_CHUNK_SECONDS,
   label: '',
   record: false,
   recordKind: 'audio',
   recordAudioFormat: 'm4a',
   recordVideoFormat: 'mkv',
   outputDir: '',
+  rev: NEWJOB_PREFS_REV,
 }
 const loadNewJobPrefs = (): NewJobPrefs => {
   try {
     const raw = localStorage.getItem(NEWJOB_PREFS_KEY)
     if (!raw) return NEWJOB_DEFAULTS
-    return { ...NEWJOB_DEFAULTS, ...(JSON.parse(raw) as Partial<NewJobPrefs>) }
+    const stored = JSON.parse(raw) as Partial<NewJobPrefs>
+    // rev 1 → 2 raised the default chunk size; adopt it instead of carrying
+    // the stale 6s forward. Everything else the user set is kept.
+    if ((stored.rev ?? 1) < 2) delete stored.chunkSeconds
+    return { ...NEWJOB_DEFAULTS, ...stored, rev: NEWJOB_PREFS_REV }
   } catch {
     return NEWJOB_DEFAULTS
   }
+}
+
+function ModelManager({ open, onClose, models, defaultModel, onChanged }: {
+  open: boolean
+  onClose: () => void
+  models: ModelInfo[]
+  defaultModel: string
+  onChanged: () => void
+}) {
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+
+  const call = async (path: string, method: 'POST' | 'DELETE') => {
+    setBusy(path)
+    setError(null)
+    try {
+      const r = await fetch(path, { method })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      onChanged()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const totalOnDisk = models.reduce((sum, m) => sum + (m.cached ? m.disk_bytes : 0), 0)
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+      <DialogTitle>模型管理</DialogTitle>
+      <DialogContent dividers>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          權重存在 Hugging Face 快取；下載後即可離線使用。目前共佔用 {formatBytes(totalOnDisk)}。
+        </Typography>
+        {error && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>{error}</Alert>}
+        <Stack spacing={1.5}>
+          {models.map((m) => (
+            <Card key={m.id} variant="outlined">
+              <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ alignItems: { sm: 'center' } }}>
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                      <Typography sx={{ fontWeight: 500 }}>{m.id}</Typography>
+                      {m.id === defaultModel && <Chip size="small" label="預設" />}
+                      {m.cached
+                        ? <Chip size="small" color="success" label={`已下載 · ${formatBytes(m.disk_bytes)}`} />
+                        : <Chip
+                            size="small"
+                            variant="outlined"
+                            // A cancelled download leaves resumable leftovers —
+                            // say so, since 卸載 can clear them.
+                            label={m.disk_bytes && !m.downloading
+                              ? `未下載 · 約 ${m.size}（殘留 ${formatBytes(m.disk_bytes)}）`
+                              : `未下載 · 約 ${m.size}`}
+                          />}
+                      {m.in_use && <Chip size="small" color="warning" label="使用中" />}
+                      {!m.live_viable && <Chip size="small" variant="outlined" label="不適合直播" />}
+                    </Stack>
+                    <Typography variant="caption" color="text.secondary">
+                      {m.params} · {m.note} · 直播建議 chunk ≥ {m.live_chunk}s
+                    </Typography>
+                    {m.downloading && (
+                      <Box sx={{ mt: 1 }}>
+                        <LinearProgress
+                          variant={m.download_total_bytes ? 'determinate' : 'indeterminate'}
+                          value={m.download_progress * 100}
+                          sx={{ height: 6, borderRadius: 3 }}
+                        />
+                        <Typography variant="caption" color="text.secondary">
+                          下載中 {(m.download_progress * 100).toFixed(0)}%
+                          {m.download_total_bytes
+                            ? ` · ${formatBytes(m.downloaded_bytes)} / ${formatBytes(m.download_total_bytes)}`
+                            : ''}
+                        </Typography>
+                      </Box>
+                    )}
+                    {m.download_error && !m.downloading && (
+                      <Typography variant="caption" color="error">下載失敗：{m.download_error}</Typography>
+                    )}
+                  </Box>
+                  <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                    {m.downloading ? (
+                      <Button
+                        size="small"
+                        color="error"
+                        startIcon={<StopIcon />}
+                        onClick={() => call(`/api/models/${m.id}/download/cancel`, 'POST')}
+                        disabled={busy !== null}
+                      >
+                        取消
+                      </Button>
+                    ) : (
+                      <Button
+                        size="small"
+                        variant={m.cached ? 'text' : 'contained'}
+                        startIcon={<DownloadIcon />}
+                        onClick={() => call(`/api/models/${m.id}/download`, 'POST')}
+                        disabled={busy !== null || m.cached}
+                      >
+                        {m.cached ? '已下載' : '下載'}
+                      </Button>
+                    )}
+                    <Tooltip title={m.in_use ? '有任務正在使用這個模型' : '刪除本機權重，之後要用需重新下載'}>
+                      <span>
+                        <Button
+                          size="small"
+                          color="error"
+                          startIcon={<DeleteOutlineIcon />}
+                          onClick={() => setConfirmDelete(m.id)}
+                          // Enabled for leftovers too, so an aborted download
+                          // can be cleaned up rather than lingering forever.
+                          disabled={busy !== null || (!m.cached && !m.disk_bytes) || m.downloading || m.in_use}
+                        >
+                          卸載
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ))}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>關閉</Button>
+      </DialogActions>
+
+      <Dialog open={confirmDelete !== null} onClose={() => setConfirmDelete(null)}>
+        <DialogTitle>卸載 {confirmDelete}？</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2">
+            會刪除本機的權重檔（釋出 {formatBytes(models.find((m) => m.id === confirmDelete)?.disk_bytes ?? 0)}）。
+            之後任何任務選到這個模型，都會先重新下載一次才能開始轉錄。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setConfirmDelete(null)}>取消</Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => {
+              const target = confirmDelete
+              setConfirmDelete(null)
+              if (target) call(`/api/models/${target}`, 'DELETE')
+            }}
+          >
+            確認卸載
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Dialog>
+  )
 }
 
 function NewJob({ onCreated, defaultOutputsDir }: {
@@ -440,6 +680,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const [language, setLanguage] = useState(initial.language)
   const [model, setModel] = useState(initial.model)
   const [models, setModels] = useState<ModelInfo[]>([])
+  const [backendDefaultModel, setBackendDefaultModel] = useState('')
   const [vad, setVad] = useState(initial.vad)
   const [listenUrl, setListenUrl] = useState(initial.listenUrl)
   const [chunkSeconds, setChunkSeconds] = useState(initial.chunkSeconds)
@@ -450,25 +691,54 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const [recordVideoFormat, setRecordVideoFormat] = useState<'mkv' | 'mp4' | 'ts'>(initial.recordVideoFormat)
   const [outputDir, setOutputDir] = useState(initial.outputDir)
   const [pickingOutputDir, setPickingOutputDir] = useState(false)
+  const [openingOutputDir, setOpeningOutputDir] = useState(false)
+  const [manageOpen, setManageOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   // Model catalog is backend-owned (it knows which weights are on disk and
   // what the configured default is), so fetch rather than hard-code it.
+  const refreshModels = async (signal?: AbortSignal) => {
+    try {
+      const r = await fetch('/api/models', { signal })
+      if (!r.ok) return
+      const data = await r.json()
+      setModels(data.models ?? [])
+      setBackendDefaultModel((data.default as string) || '')
+      // Only adopt the backend default when the user has no stored choice.
+      setModel((cur) => cur || (data.default as string) || '')
+    } catch { /* offline backend — the Select just stays empty */ }
+  }
+
   useEffect(() => {
     const ctrl = new AbortController()
-    ;(async () => {
-      try {
-        const r = await fetch('/api/models', { signal: ctrl.signal })
-        if (!r.ok) return
-        const data = await r.json()
-        setModels(data.models ?? [])
-        // Only adopt the backend default when the user has no stored choice.
-        setModel((cur) => cur || (data.default as string) || '')
-      } catch { /* offline backend — the Select just stays empty */ }
-    })()
+    refreshModels(ctrl.signal)
     return () => ctrl.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Poll only while it matters: the manager is open, or a download is running
+  // in the background (so the Select's "未下載" hints settle on their own).
+  const anyDownloading = models.some((m) => m.downloading)
+  useEffect(() => {
+    if (!manageOpen && !anyDownloading) return
+    const ctrl = new AbortController()
+    const t = setInterval(() => refreshModels(ctrl.signal), 1500)
+    return () => { ctrl.abort(); clearInterval(t) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manageOpen, anyDownloading])
+
+  const downloadModel = async (id: string) => {
+    setError(null)
+    try {
+      const r = await fetch(`/api/models/${id}/download`, { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+      refreshModels()
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
 
   const pickOutputDir = async () => {
     setPickingOutputDir(true)
@@ -482,6 +752,21 @@ function NewJob({ onCreated, defaultOutputsDir }: {
       setError((e as Error).message)
     } finally {
       setPickingOutputDir(false)
+    }
+  }
+
+  // Blank field means "use the global default", so that's what we open.
+  const openOutputDir = async () => {
+    const target = outputDir.trim() || defaultOutputsDir
+    if (!target) return
+    setError(null)
+    setOpeningOutputDir(true)
+    try {
+      await revealFolder(target)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setOpeningOutputDir(false)
     }
   }
 
@@ -512,7 +797,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
     const prefs: NewJobPrefs = {
       mode, language, model, vad, listenUrl, chunkSeconds, label,
       record, recordKind, recordAudioFormat, recordVideoFormat,
-      outputDir,
+      outputDir, rev: NEWJOB_PREFS_REV,
     }
     try { localStorage.setItem(NEWJOB_PREFS_KEY, JSON.stringify(prefs)) } catch { /* ignore quota */ }
   }
@@ -710,7 +995,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
                 label="chunk 秒數"
                 type="number"
                 value={chunkSeconds}
-                onChange={(e) => setChunkSeconds(Number(e.target.value) || 6)}
+                onChange={(e) => setChunkSeconds(Number(e.target.value) || DEFAULT_CHUNK_SECONDS)}
                 slotProps={{ htmlInput: { min: 2, max: 60 } }}
                 sx={{ width: 140 }}
               />
@@ -820,6 +1105,19 @@ function NewJob({ onCreated, defaultOutputsDir }: {
             slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } } }}
           />
           <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+            <Tooltip title={outputDir.trim() ? '在檔案總管／Finder 開啟這個資料夾' : '在檔案總管／Finder 開啟預設輸出資料夾'}>
+              <span>
+                <Button
+                  size="small"
+                  startIcon={<FolderOpenIcon />}
+                  onClick={openOutputDir}
+                  disabled={openingOutputDir || (!outputDir.trim() && !defaultOutputsDir)}
+                  sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}
+                >
+                  開啟
+                </Button>
+              </span>
+            </Tooltip>
             <Tooltip title="開啟本機原生資料夾選擇對話框">
               <span>
                 <Button size="small" onClick={pickOutputDir} disabled={pickingOutputDir} sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}>
@@ -850,23 +1148,66 @@ function NewJob({ onCreated, defaultOutputsDir }: {
             <Select label="模型" value={models.length ? model : ''} onChange={(e) => setModel(e.target.value)}>
               {models.map((m) => (
                 <MenuItem key={m.id} value={m.id}>
-                  {m.id} · {m.note}{m.cached ? '' : `（未下載 ${m.size}）`}
+                  {m.id} · {m.note}
+                  {m.downloading
+                    ? `（下載中 ${(m.download_progress * 100).toFixed(0)}%）`
+                    : m.cached ? '' : `（未下載 ${m.size}）`}
                 </MenuItem>
               ))}
             </Select>
           </FormControl>
+          <Tooltip title="下載或卸載本機的模型權重">
+            <Button
+              size="small"
+              startIcon={<StorageIcon />}
+              onClick={() => setManageOpen(true)}
+              sx={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+            >
+              模型管理
+            </Button>
+          </Tooltip>
           <FormControlLabel
             control={<Checkbox checked={vad} onChange={(e) => setVad(e.target.checked)} />}
             label="VAD（過濾靜音）"
           />
         </Stack>
 
+        <ModelManager
+          open={manageOpen}
+          onClose={() => setManageOpen(false)}
+          models={models}
+          defaultModel={backendDefaultModel}
+          onChanged={refreshModels}
+        />
+
         {selectedModel && !selectedModel.cached && (
-          <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+          <Alert
+            severity="info"
+            variant="outlined"
+            sx={{ mb: 2 }}
+            action={!selectedModel.downloading && (
+              <Button size="small" color="inherit" onClick={() => downloadModel(selectedModel.id)}>
+                先下載
+              </Button>
+            )}
+          >
             <Typography variant="body2">
               第一次使用 <strong>{selectedModel.id}</strong> 會先下載約 {selectedModel.size} 的權重，
               這段期間任務會停在開頭不動，屬正常現象。下載完成後就會快取起來，之後不用再等。
             </Typography>
+            {selectedModel.downloading && (
+              <Box sx={{ mt: 1 }}>
+                <LinearProgress
+                  variant="determinate"
+                  value={selectedModel.download_progress * 100}
+                  sx={{ height: 6, borderRadius: 3 }}
+                />
+                <Typography variant="caption" color="text.secondary">
+                  下載中 {(selectedModel.download_progress * 100).toFixed(0)}%
+                  （{formatBytes(selectedModel.downloaded_bytes)} / {formatBytes(selectedModel.download_total_bytes)}）
+                </Typography>
+              </Box>
+            )}
           </Alert>
         )}
         {selectedModel?.cached && <Box sx={{ mb: 1.5 }} />}
@@ -914,6 +1255,8 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [receiving, setReceiving] = useState<boolean>(false)
   const [recordPath, setRecordPath] = useState<string | null>(null)
   const [recordKind, setRecordKind] = useState<'audio' | 'video' | null>(null)
+  const [outputPath, setOutputPath] = useState<string | null>(null)
+  const [openingDir, setOpeningDir] = useState(false)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const autoScrollRef = useRef(true)
   const sseAbortRef = useRef<AbortController | null>(null)
@@ -926,6 +1269,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       setListenUrl(j.listen_url || null)
       setRecordPath(j.record_path || null)
       setRecordKind(j.record_kind || null)
+      setOutputPath(j.output_path || null)
     })
     const ctrl = new AbortController()
     sseAbortRef.current = ctrl
@@ -1017,6 +1361,23 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const fullText = segments.map((s) => s.text).join('\n')
   const handleCopy = () => navigator.clipboard.writeText(fullText)
 
+  // The backend knows the job's folder; let it open it directly so we never
+  // have to string-manipulate paths (Windows separators, trailing slashes…).
+  const openJobDir = async () => {
+    setOpeningDir(true)
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/reveal`, { method: 'POST' })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setOpeningDir(false)
+    }
+  }
+
+  const jobDir = outputPath ? outputPath.replace(/[/\\][^/\\]*$/, '') : null
+
   const isActive = status === 'running' || status === 'paused'
 
   return (
@@ -1081,6 +1442,13 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
             <Button startIcon={<ContentCopyIcon />} onClick={handleCopy} disabled={!segments.length}>
               複製全文
             </Button>
+            <Tooltip title={jobDir ?? ''}>
+              <span>
+                <Button startIcon={<FolderOpenIcon />} onClick={openJobDir} disabled={!jobDir || openingDir}>
+                  開啟資料夾
+                </Button>
+              </span>
+            </Tooltip>
             <Button
               component="a"
               href={`/api/jobs/${jobId}/output`}

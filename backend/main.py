@@ -52,6 +52,12 @@ MODEL_CATALOG: dict[str, dict] = {
 }
 
 
+# Default live chunk size. Matches `medium`'s `live_chunk` above — the default
+# model — so a live job started with everything untouched already keeps up with
+# the stream instead of falling behind and warning.
+DEFAULT_CHUNK_SECONDS = 15.0
+
+
 def live_chunk_hint(model: str) -> int:
     """Recommended minimum live chunk seconds for `model` (default 6)."""
     return int(MODEL_CATALOG.get(model, {}).get("live_chunk", 6))
@@ -90,6 +96,138 @@ def model_is_cached(model: str) -> bool:
     return False
 
 
+def _model_repo_dir(model: str) -> Path:
+    return _hf_cache_root() / f"models--Systran--faster-whisper-{model}"
+
+
+def model_disk_bytes(model: str) -> int:
+    """Bytes this model currently occupies in the HF cache.
+
+    Only `blobs/` is measured: snapshots are symlinks into it, so walking the
+    whole repo dir would double-count. In-flight downloads land in
+    `*.incomplete` blobs, which is exactly what makes this usable as a
+    progress signal while a download runs.
+    """
+    blobs = _model_repo_dir(model) / "blobs"
+    if not blobs.is_dir():
+        return 0
+    total = 0
+    for f in blobs.iterdir():
+        try:
+            total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _catalog_bytes(model: str) -> int:
+    """Approximate download size from the catalog's human string ("1.5 GB")."""
+    raw = str(MODEL_CATALOG.get(model, {}).get("size", "")).strip().upper()
+    unit = 1024 ** 3 if raw.endswith("GB") else 1024 ** 2
+    try:
+        return int(float(raw.rstrip("BGM ").strip()) * unit)
+    except ValueError:
+        return 0
+
+
+# Model downloads run as killable subprocesses (same reasoning as the
+# transcription workers): huggingface_hub's fetch is a blocking call with no
+# cancellation hook, so a thread could not be stopped once started. Interrupted
+# downloads resume from what's already in the cache on the next attempt.
+_DOWNLOADS_LOCK = threading.Lock()
+# model -> {"proc", "status", "error", "downloaded", "total"}
+_DOWNLOADS: dict[str, dict] = {}
+
+
+def _download_state(model: str) -> dict:
+    with _DOWNLOADS_LOCK:
+        return dict(_DOWNLOADS.get(model) or {})
+
+
+def start_model_download(model: str) -> dict:
+    with _DOWNLOADS_LOCK:
+        current = _DOWNLOADS.get(model)
+        if current and current["status"] == "running":
+            raise HTTPException(409, f"{model} is already downloading")
+        python_bin = str(PYTHON_BIN) if PYTHON_BIN.exists() else sys.executable
+        # stderr folded into stdout: one pipe can't deadlock on a full buffer,
+        # and any non-NDJSON noise doubles as the error tail below.
+        proc = subprocess.Popen(
+            [python_bin, str(DOWNLOAD_WORKER_PATH)],
+            cwd=str(BACKEND_DIR),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            bufsize=1,
+            text=True,
+        )
+        proc.stdin.write(json.dumps({"model": model}) + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+        entry = {"proc": proc, "status": "running", "error": None,
+                 "downloaded": 0, "total": _catalog_bytes(model)}
+        _DOWNLOADS[model] = entry
+
+    def _update(**fields) -> bool:
+        """Apply fields to this model's entry; False once it's been superseded."""
+        with _DOWNLOADS_LOCK:
+            entry = _DOWNLOADS.get(model)
+            if not entry or entry["proc"] is not proc:
+                return False
+            entry.update(fields)
+            return True
+
+    def _pump() -> None:
+        noise: list[str] = []
+        last_error: Optional[str] = None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                noise.append(line)
+                del noise[:-5]  # only the tail is useful for diagnosis
+                continue
+            if event.get("type") == "progress":
+                if not _update(downloaded=event.get("downloaded", 0),
+                               total=event.get("total") or _catalog_bytes(model)):
+                    return
+            elif event.get("type") == "error":
+                last_error = event.get("message")
+        code = proc.wait()
+        with _DOWNLOADS_LOCK:
+            entry = _DOWNLOADS.get(model)
+            if not entry or entry["proc"] is not proc:
+                return  # superseded by a newer download
+            if entry["status"] == "cancelled":
+                return
+            if code == 0:
+                entry["status"] = "done"
+            else:
+                entry["status"] = "error"
+                entry["error"] = last_error or (noise[-1] if noise else f"exit code {code}")
+
+    threading.Thread(target=_pump, name=f"meet-dl-{model}", daemon=True).start()
+    return {"status": "running"}
+
+
+def cancel_model_download(model: str) -> dict:
+    with _DOWNLOADS_LOCK:
+        entry = _DOWNLOADS.get(model)
+        if not entry or entry["status"] != "running":
+            raise HTTPException(409, f"{model} is not downloading")
+        entry["status"] = "cancelled"
+        proc = entry["proc"]
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    return {"status": "cancelled"}
+
+
 def resolve_model(raw: Optional[str]) -> str:
     """Validate a per-job model override, falling back to the configured default.
 
@@ -107,6 +245,7 @@ def resolve_model(raw: Optional[str]) -> str:
 BACKEND_DIR = Path(__file__).resolve().parent
 WORKER_PATH = BACKEND_DIR / "worker.py"
 LIVE_WORKER_PATH = BACKEND_DIR / "live_worker.py"
+DOWNLOAD_WORKER_PATH = BACKEND_DIR / "download_worker.py"
 PYTHON_BIN = BACKEND_DIR / ".venv" / "bin" / "python"
 DEFAULT_LIVE_LISTEN_URL = os.environ.get("MEET_LIVE_LISTEN_URL", "tcp://0.0.0.0:9999?listen=1")
 
@@ -272,7 +411,7 @@ class Job:
     error: Optional[str] = None
     live: bool = False
     listen_url: Optional[str] = None
-    chunk_seconds: float = 6.0
+    chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     record_path: Optional[str] = None
     record_kind: Optional[str] = None  # "audio" | "video"
 
@@ -497,20 +636,77 @@ def list_models() -> dict:
         "default": MODEL_SIZE,
         "device": DEVICE,
         "compute": COMPUTE_TYPE,
-        "models": [
-            {
-                "id": name,
-                "params": meta["params"],
-                "size": meta["size"],
-                "note": meta["note"],
-                "rtf": meta["rtf"],
-                "live_chunk": meta["live_chunk"],
-                "live_viable": meta["live_viable"],
-                "cached": model_is_cached(name),
-            }
-            for name, meta in MODEL_CATALOG.items()
-        ],
+        "models": [_model_entry(name, meta) for name, meta in MODEL_CATALOG.items()],
     }
+
+
+def _model_entry(name: str, meta: dict) -> dict:
+    state = _download_state(name)
+    downloading = state.get("status") == "running"
+    total = state.get("total") or _catalog_bytes(name)
+    downloaded = state.get("downloaded") or 0
+    return {
+        "id": name,
+        "params": meta["params"],
+        "size": meta["size"],
+        "note": meta["note"],
+        "rtf": meta["rtf"],
+        "live_chunk": meta["live_chunk"],
+        "live_viable": meta["live_viable"],
+        "cached": model_is_cached(name),
+        "disk_bytes": model_disk_bytes(name),
+        "downloading": downloading,
+        # Byte counts come from the worker's tqdm hook; until the first bar
+        # exists we fall back to the catalog size so the UI has a denominator.
+        "downloaded_bytes": downloaded if downloading else 0,
+        "download_total_bytes": total if downloading else 0,
+        "download_progress": min(1.0, downloaded / total) if downloading and total else 0.0,
+        "download_error": state.get("error"),
+        "in_use": name in _models_in_use(),
+    }
+
+
+def _models_in_use() -> set[str]:
+    """Models belonging to jobs that could still load weights off disk."""
+    return {j.model for j in JOBS.values() if j.status in ("queued", "running", "paused")}
+
+
+@app.post("/api/models/{model}/download")
+def download_model_endpoint(model: str) -> dict:
+    if model not in MODEL_CATALOG:
+        raise HTTPException(404, f"unknown model: {model}")
+    if model_is_cached(model):
+        return {"ok": True, "status": "done"}
+    return {"ok": True, **start_model_download(model)}
+
+
+@app.post("/api/models/{model}/download/cancel")
+def cancel_model_download_endpoint(model: str) -> dict:
+    if model not in MODEL_CATALOG:
+        raise HTTPException(404, f"unknown model: {model}")
+    return {"ok": True, **cancel_model_download(model)}
+
+
+@app.delete("/api/models/{model}")
+def delete_model(model: str) -> dict:
+    """Remove a model's weights from the HF cache to reclaim disk."""
+    if model not in MODEL_CATALOG:
+        raise HTTPException(404, f"unknown model: {model}")
+    if _download_state(model).get("status") == "running":
+        raise HTTPException(409, f"{model} is downloading; cancel it first")
+    if model in _models_in_use():
+        raise HTTPException(409, f"{model} is in use by an active job")
+    repo = _model_repo_dir(model)
+    if not repo.exists():
+        raise HTTPException(404, f"{model} is not downloaded")
+    freed = model_disk_bytes(model)
+    try:
+        shutil.rmtree(repo)
+    except OSError as exc:
+        raise HTTPException(500, f"cannot delete {model}: {exc}") from exc
+    with _DOWNLOADS_LOCK:
+        _DOWNLOADS.pop(model, None)
+    return {"ok": True, "freed_bytes": freed}
 
 
 @app.get("/api/outputs-dir")
@@ -570,6 +766,56 @@ def pick_outputs_dir() -> dict:
         except Exception as exc:  # tk not installed, no display, etc.
             raise HTTPException(500, f"native folder picker unavailable: {exc}") from exc
     return {"path": chosen or ""}
+
+
+def _open_dir_in_file_manager(path: Path) -> None:
+    """Open `path` in the desktop file manager of the machine running the backend.
+
+    Only ever called with a directory (see `reveal_path`): `open`/`xdg-open` on a
+    *file* would launch it in its default application, which — with CORS wide
+    open on localhost — any web page could abuse. Handing them a folder just
+    pops a Finder/Explorer window.
+    """
+    if sys.platform == "darwin":
+        cmd = ["open", str(path)]
+    elif sys.platform.startswith("win"):
+        cmd = ["explorer", str(path)]
+    else:
+        cmd = ["xdg-open", str(path)]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError as exc:
+        raise HTTPException(500, f"cannot open file manager: {cmd[0]} not found") from exc
+
+
+@app.post("/api/reveal")
+def reveal_path(payload: dict = Body(...)) -> dict:
+    """Open a folder on the host machine. Directories only — see `_open_dir_in_file_manager`."""
+    raw = (payload or {}).get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise HTTPException(400, "path is required")
+    target = Path(raw.strip()).expanduser()
+    try:
+        target = target.resolve()
+    except OSError as exc:
+        raise HTTPException(400, f"cannot resolve path: {exc}") from exc
+    if not target.exists():
+        raise HTTPException(404, f"folder does not exist: {target}")
+    if not target.is_dir():
+        raise HTTPException(400, "only folders can be opened")
+    _open_dir_in_file_manager(target)
+    return {"ok": True, "path": str(target)}
+
+
+@app.post("/api/jobs/{job_id}/reveal")
+def reveal_job_dir(job_id: str) -> dict:
+    """Open the folder holding this job's transcript / recording."""
+    job = JOBS.get(job_id) or _404()
+    job_dir = Path(job.output_path).parent
+    if not job_dir.is_dir():
+        raise HTTPException(404, f"folder does not exist: {job_dir}")
+    _open_dir_in_file_manager(job_dir)
+    return {"ok": True, "path": str(job_dir)}
 
 
 @app.post("/api/jobs")
@@ -722,7 +968,7 @@ async def create_live_job(
     language: Optional[str] = Form(None),
     vad: bool = Form(True),
     beam_size: int = Form(5),
-    chunk_seconds: float = Form(6.0),
+    chunk_seconds: float = Form(DEFAULT_CHUNK_SECONDS),
     label: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
     record: bool = Form(False),
