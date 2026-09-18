@@ -159,8 +159,17 @@ Production build：`npm run build`，產物在 `frontend/dist/`。
 OBS 主視窗右下「**開始錄製**」（不是「開始直播」，因為設定在「錄製」分頁）。回到瀏覽器：逐字稿一段一段冒出來。
 
 結束時：
-- 想保留逐字稿與錄影：**先在 OBS 按「停止錄製」**，meet 那邊串流結束會自動進入 `done`，影片會 mux 完整
+- 想保留逐字稿與錄影：**先在 OBS 按「停止錄製」**，meet 會再等一段寬限期（預設 60 秒）看 OBS 會不會回來，沒有的話才進入 `done`，影片會 mux 完整
 - 直接喊停：在 meet 頁面按「**⏹ 停止監聽**」也行（但若有錄影、用 mp4 容器可能 moov atom 沒寫完整 → 用 mkv 較安全）
+
+#### B-3b. 斷線與重連
+
+OBS 中途斷掉（網路抖一下、你去改場景重開推流）不會結束任務：監聽埠會維持開著
+`MEET_LIVE_RECONNECT_GRACE` 秒（預設 60），OBS 自動重連進來就接著轉，UI 會顯示「已重新連線 N 次」。
+重連後的錄影／錄音沒辦法續寫同一個容器，所以會另存成 `recording.2.mkv`、`recording.3.mkv`……
+
+轉錄跟不上串流時**不會再拖慢或掐斷 OBS**：來不及轉的音訊排在 meet 的記憶體裡（上限
+`MEET_LIVE_MAX_BACKLOG` 秒，預設 600，超過丟最舊的），UI 會顯示落後幾秒。
 
 #### B-4. 驗證連線（可選）
 
@@ -242,6 +251,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | ts | 適合進一步處理／串流分段 | 不適合直接給人看 |
 
 完成（或中止）後 Web UI 會出現「下載錄影」按鈕；也可直接抓 `outputs/{job_id}.{mkv|mp4|ts}`。
+中途斷線重連過的話，每次連線各自一個檔（`recording.mkv`、`recording.2.mkv`…）。
 
 ---
 
@@ -297,6 +307,8 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `MEET_PORT` | `7001` | CLI 預設要連的 backend port |
 | `MEET_OUTPUTS_DIR` | `<repo>/outputs` | 後端寫逐字稿／錄影的目錄 |
 | `MEET_LIVE_LISTEN_URL` | `tcp://0.0.0.0:9999?listen=1` | 直播 listener 預設 URL |
+| `MEET_LIVE_RECONNECT_GRACE` | `60` | 直播斷線後保留監聽埠等待重連的秒數；設 `0` 表示斷了就結束 |
+| `MEET_LIVE_MAX_BACKLOG` | `600` | 轉錄落後時最多在記憶體暫存幾秒音訊，超過就丟掉最舊的 |
 | `MEET_WEB_PORT` | `7002` | CLI `--web` 預設 port |
 
 ---
@@ -414,6 +426,13 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 // 一段一筆
 { "type": "segment", "start": 0.0, "end": 3.2, "text": "…" }
 
+// 直播模式才有：轉錄落後／追上（lagging=false 代表追上了）
+{ "type": "backlog", "seconds": 42.0, "lagging": true }
+
+// 直播模式才有：OBS 斷線（開始等重連）／重新連上（record_path 是這次連線的錄影檔）
+{ "type": "disconnected", "attempt": 0, "grace_seconds": 60.0, "rc": 0 }
+{ "type": "reconnected", "attempt": 1, "record_path": "outputs/…/recording.2.mkv" }
+
 // 任務狀態變化
 { "type": "state", "status": "running|paused|done|error|cancelled", "error": null }
 
@@ -443,6 +462,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `Couldn't open 'http://127.0.0.1:9999', Connection refused` | OBS URL 開頭錯了，要 `tcp://` 不是 `http://` |
 | `Couldn't open 'tcp://127.0.0.1:9999', Connection refused` | meet 還沒按「開始監聽」，listener 不在；先建任務再開 OBS |
 | meet 任務直接 `error: ffmpeg exited rc=195` | meet 的監聽 URL 少了 `?listen=1`（後端已自動補；若還出現代表 URL 用了不能 listen 的協定，例如 SRT 沒 libsrt） |
+| 串流跑一跑 OBS 自己斷線／一直掉幀 | 舊版 meet 在轉錄時會停止讀取 ffmpeg 的 PCM pipe，反壓一路頂回 OBS（實測送端被壓到 0.8×）。已修正為獨立的讀取執行緒；若仍發生，先確認不是 OBS 端的網路或編碼器過載 |
 | 直播段落都是空的或亂碼 | 麥克風沒進 OBS／視訊軌道沒勾／音訊位元率太低；用 OBS 內建「監聽」確認來源有聲音 |
 | 段落邊界切到字 | `chunk_seconds` 過小（`medium` 建議 15 以上）；太短反而碎 |
 | `outputs/` 沒看到檔案 | CLI 沒帶 `--outputs-dir` 或後端是別人起的；`/api/health` 看 `outputs_dir` 真實位置 |

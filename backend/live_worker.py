@@ -5,8 +5,27 @@ audio/video stream from the configured listen URL (e.g. OBS streaming to
 ``tcp://0.0.0.0:9999?listen=1``), then runs faster-whisper on fixed-size
 PCM chunks and emits NDJSON events on stdout.
 
-Event schema is identical to ``worker.py`` plus a one-shot ``listening``
-event emitted after the model is loaded and ffmpeg has been spawned.
+Event schema is identical to ``worker.py`` plus live-only events:
+``listening`` (model loaded, ffmpeg spawned), ``receiving`` (first PCM
+bytes arrived), ``backlog`` (transcription is falling behind / caught up
+again), ``disconnected`` (the sender went away, waiting for it to come
+back) and ``reconnected`` (a new sender connected).
+
+Two things this worker must never do, both learned the hard way:
+
+1. **Never stop reading ffmpeg's PCM pipe.** Transcription is far slower
+   than the ~2 s of audio a 64 KB pipe holds, so a read loop that calls
+   whisper inline leaves ffmpeg blocked in ``write(pipe:1)``. ffmpeg's
+   transcode loop is single-threaded, so a blocked output also stops it
+   from draining the TCP socket — the backpressure travels all the way to
+   OBS, which cannot slow down a live capture and drops the connection.
+   Measured: the sender gets throttled to ~0.8x realtime. Hence the
+   dedicated reader thread below; when whisper falls behind, audio piles
+   up in *our* memory instead of in the kernel's socket buffers.
+2. **Never treat EOF as the end of the session.** ``?listen=1`` accepts a
+   single connection, so an OBS restart or a momentary blip would end the
+   job and stop listening, leaving OBS's auto-reconnect with nothing to
+   connect to. Instead we respawn ffmpeg and wait out a grace period.
 
 Lifecycle is controlled by the parent via signals: SIGSTOP/SIGCONT pause
 and resume the entire process group (including ffmpeg) and SIGTERM
@@ -22,6 +41,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -35,6 +55,18 @@ _LANG_PROMPTS = {
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # s16le mono
+
+# How long to keep the port open after the sender disconnects before giving
+# up on the session. OBS' auto-reconnect retries every few seconds, so a
+# minute covers "I stopped streaming to fix a scene and started again".
+RECONNECT_GRACE_SECONDS = float(os.environ.get("MEET_LIVE_RECONNECT_GRACE", "60"))
+
+# Hard cap on un-transcribed audio held in memory when whisper can't keep
+# up. 600 s of 16k mono s16le is ~19 MB; past that the transcript is so far
+# behind that keeping the audio helps nobody, so we drop the oldest.
+MAX_BACKLOG_SECONDS = float(os.environ.get("MEET_LIVE_MAX_BACKLOG", "600"))
+
+READ_SIZE = 65536
 
 
 def resolve_language(lang):
@@ -53,6 +85,11 @@ def emit(event):
 
 
 _FFMPEG: Optional[subprocess.Popen] = None
+
+# Set by the signal handler so the reconnect loop never respawns ffmpeg while
+# we are on our way out (cancel sends SIGINT to the whole process group, so
+# ffmpeg EOFs at the same moment the handler fires).
+_STOPPING = False
 
 
 def _terminate_ffmpeg() -> None:
@@ -94,8 +131,150 @@ def _terminate_ffmpeg() -> None:
 
 
 def _on_term(signum, frame):
+    global _STOPPING
+    _STOPPING = True
     _terminate_ffmpeg()
     sys.exit(0)
+
+
+class PcmReader:
+    """Drains ffmpeg's PCM stdout into memory on a dedicated thread.
+
+    The whole point is that ``os.read`` keeps running while the main thread
+    is inside ``model.transcribe`` — see note 1 in the module docstring.
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self._proc = proc
+        self._chunks: "collections.deque[bytes]" = collections.deque()
+        self._cv = threading.Condition()
+        self._eof = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        fd = self._proc.stdout.fileno()
+        while True:
+            try:
+                data = os.read(fd, READ_SIZE)
+            except OSError:
+                data = b""
+            with self._cv:
+                if not data:
+                    self._eof = True
+                    self._cv.notify_all()
+                    return
+                self._chunks.append(data)
+                self._cv.notify_all()
+
+    def drain(self, timeout: float) -> tuple[bytes, bool]:
+        """Return (bytes read so far, eof). Waits up to `timeout` for data."""
+        with self._cv:
+            if not self._chunks and not self._eof:
+                self._cv.wait(timeout)
+            data = b"".join(self._chunks)
+            self._chunks.clear()
+            return data, (self._eof and not data)
+
+
+def build_ffmpeg_args(listen_url: str, record_path: Optional[str], record_kind: str) -> list[str]:
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", listen_url,
+    ]
+    if record_path:
+        # Output 1: persist a local copy of the stream. For "video" kind we
+        # stream-copy everything (video+audio) — no re-encode. For "audio" kind
+        # we keep just the audio track; OBS' mpegts pipeline produces AAC, so
+        # m4a/aac stream-copies cleanly; mp3/wav must re-encode.
+        if record_kind == "audio":
+            ext = os.path.splitext(record_path)[1].lower().lstrip(".")
+            if ext == "mp3":
+                args += ["-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "192k", record_path]
+            elif ext == "wav":
+                args += ["-map", "0:a:0", "-c:a", "pcm_s16le", record_path]
+            else:  # m4a / aac / mp4 audio-only
+                # m4a (ipod muxer) only accepts AAC/ALAC. OBS' "Custom FFmpeg
+                # Output" defaults to MP2 in many mpegts presets, which fails
+                # stream-copy into m4a with rc=234 / EINVAL. Always transcode
+                # to AAC so the recording works regardless of OBS settings.
+                # Fragmented MP4 so the file stays playable if ffmpeg is
+                # killed mid-stream (otherwise the moov atom never lands).
+                args += [
+                    "-map", "0:a:0", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    record_path,
+                ]
+        else:
+            # mp4/m4v/mov containers don't accept arbitrary audio codecs (e.g.
+            # OBS' default MP2 in mpegts) → stream-copy fails with rc=234.
+            # Transcode audio to AAC for these, keep video as stream-copy.
+            # mkv/ts/mpegts accept anything → safe to copy everything.
+            vext = os.path.splitext(record_path)[1].lower().lstrip(".")
+            if vext in ("mp4", "m4v", "mov"):
+                # Fragmented MP4 — playable even if ffmpeg is killed before
+                # writing the trailing moov atom.
+                args += [
+                    "-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    record_path,
+                ]
+            else:
+                args += ["-map", "0", "-c", "copy", record_path]
+    # Output 2: 16k mono PCM on stdout for whisper.
+    args += [
+        "-map", "0:a:0",
+        "-ac", "1", "-ar", str(SAMPLE_RATE),
+        "-f", "s16le", "pipe:1",
+    ]
+    return args
+
+
+def record_path_for(base: Optional[str], attempt: int) -> Optional[str]:
+    """Recording path for the n-th connection.
+
+    A reconnect means a fresh ffmpeg, and no container can be reopened and
+    appended to, so each reconnect writes its own numbered file next to the
+    first one: ``recording.mkv``, ``recording.2.mkv``, …
+    """
+    if not base or attempt == 0:
+        return base
+    root, ext = os.path.splitext(base)
+    return f"{root}.{attempt + 1}{ext}"
+
+
+def spawn_ffmpeg(args: list[str]) -> tuple[subprocess.Popen, "collections.deque[str]", dict]:
+    global _FFMPEG
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    )
+    _FFMPEG = proc
+
+    # Drain ffmpeg's stderr in a background thread so we can surface the
+    # last few lines if it exits non-zero (e.g. rc=234 / EINVAL).
+    stderr_tail: "collections.deque[str]" = collections.deque(maxlen=20)
+    # When *we* tear down an idle listener, ffmpeg complains ("Error opening
+    # input file ...") — that's our doing, not a stream problem, so the
+    # caller flips `quiet` first to keep it out of the job's event log.
+    flags = {"quiet": False}
+
+    def _pump_stderr() -> None:
+        assert proc.stderr
+        for raw in proc.stderr:
+            try:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+            except Exception:
+                continue
+            if line:
+                stderr_tail.append(line)
+                if not flags["quiet"]:
+                    emit({"type": "ffmpeg_log", "line": line})
+
+    threading.Thread(target=_pump_stderr, daemon=True).start()
+    return proc, stderr_tail, flags
 
 
 def main():
@@ -110,7 +289,9 @@ def main():
     chunk_seconds = float(config.get("chunk_seconds", 15.0))
     record_path = config.get("record_path")  # optional path to mux a copy of the stream
     record_kind = config.get("record_kind", "video")  # "video" (stream-copy all) | "audio" (audio only)
+    grace = float(config.get("reconnect_grace_seconds", RECONNECT_GRACE_SECONDS))
     chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
+    max_backlog_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * MAX_BACKLOG_SECONDS)
 
     signal.signal(signal.SIGTERM, _on_term)
     # main.py cancels live jobs by sending SIGINT to the worker group so
@@ -124,93 +305,11 @@ def main():
         emit({"type": "error", "message": f"model load failed: {exc}"})
         sys.exit(1)
 
-    ffmpeg_args = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", listen_url,
-    ]
-    if record_path:
-        # Output 1: persist a local copy of the stream. For "video" kind we
-        # stream-copy everything (video+audio) — no re-encode. For "audio" kind
-        # we keep just the audio track; OBS' mpegts pipeline produces AAC, so
-        # m4a/aac stream-copies cleanly; mp3/wav must re-encode.
-        if record_kind == "audio":
-            ext = os.path.splitext(record_path)[1].lower().lstrip(".")
-            if ext == "mp3":
-                ffmpeg_args += ["-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "192k", record_path]
-            elif ext == "wav":
-                ffmpeg_args += ["-map", "0:a:0", "-c:a", "pcm_s16le", record_path]
-            else:  # m4a / aac / mp4 audio-only
-                # m4a (ipod muxer) only accepts AAC/ALAC. OBS' "Custom FFmpeg
-                # Output" defaults to MP2 in many mpegts presets, which fails
-                # stream-copy into m4a with rc=234 / EINVAL. Always transcode
-                # to AAC so the recording works regardless of OBS settings.
-                # Fragmented MP4 so the file stays playable if ffmpeg is
-                # killed mid-stream (otherwise the moov atom never lands).
-                ffmpeg_args += [
-                    "-map", "0:a:0", "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-                    record_path,
-                ]
-        else:
-            # mp4/m4v/mov containers don't accept arbitrary audio codecs (e.g.
-            # OBS' default MP2 in mpegts) → stream-copy fails with rc=234.
-            # Transcode audio to AAC for these, keep video as stream-copy.
-            # mkv/ts/mpegts accept anything → safe to copy everything.
-            vext = os.path.splitext(record_path)[1].lower().lstrip(".")
-            if vext in ("mp4", "m4v", "mov"):
-                # Fragmented MP4 — playable even if ffmpeg is killed before
-                # writing the trailing moov atom.
-                ffmpeg_args += [
-                    "-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-                    record_path,
-                ]
-            else:
-                ffmpeg_args += ["-map", "0", "-c", "copy", record_path]
-    # Output 2: 16k mono PCM on stdout for whisper.
-    ffmpeg_args += [
-        "-map", "0:a:0",
-        "-ac", "1", "-ar", str(SAMPLE_RATE),
-        "-f", "s16le", "pipe:1",
-    ]
-
-    global _FFMPEG
-    _FFMPEG = subprocess.Popen(
-        ffmpeg_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-    )
-
-    # Drain ffmpeg's stderr in a background thread so we can surface the
-    # last few lines if it exits non-zero (e.g. rc=234 / EINVAL).
-    stderr_tail: "collections.deque[str]" = collections.deque(maxlen=20)
-
-    def _pump_stderr() -> None:
-        assert _FFMPEG and _FFMPEG.stderr
-        for raw in _FFMPEG.stderr:
-            try:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-            except Exception:
-                continue
-            if line:
-                stderr_tail.append(line)
-                emit({"type": "ffmpeg_log", "line": line})
-
-    threading.Thread(target=_pump_stderr, daemon=True).start()
-
-    emit({
-        "type": "listening",
-        "url": listen_url,
-        "chunk_seconds": chunk_seconds,
-        "sample_rate": SAMPLE_RATE,
-        "record_path": record_path,
-    })
-
     whisper_lang, initial_prompt = resolve_language(language)
     info_emitted = False
     chunk_index = 0
     buf = bytearray()
+    lagging = False
 
     def transcribe_chunk(pcm: bytes, t0: float) -> None:
         nonlocal info_emitted
@@ -248,46 +347,136 @@ def main():
         except Exception as exc:
             emit({"type": "error", "message": f"transcribe error: {exc}"})
 
-    try:
-        fd = _FFMPEG.stdout.fileno()
-        receiving_emitted = False
-        while True:
-            try:
-                data = os.read(fd, 8192)
-            except OSError:
-                break
-            if not data:
-                break
-            if not receiving_emitted:
-                emit({"type": "receiving"})
-                receiving_emitted = True
-            buf.extend(data)
-            while len(buf) >= chunk_bytes:
-                t0 = chunk_index * chunk_seconds
-                pcm = bytes(buf[:chunk_bytes])
-                del buf[:chunk_bytes]
-                chunk_index += 1
-                transcribe_chunk(pcm, t0)
-        # flush trailing buffer if it's at least 1 second long
-        if len(buf) >= SAMPLE_RATE * BYTES_PER_SAMPLE:
-            transcribe_chunk(bytes(buf), chunk_index * chunk_seconds)
+    def report_backlog() -> None:
+        """Tell the parent how far behind whisper is, on change."""
+        nonlocal lagging
+        seconds = len(buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+        if seconds >= chunk_seconds:
+            lagging = True
+            emit({"type": "backlog", "seconds": round(seconds, 1), "lagging": True})
+        elif lagging and seconds < chunk_seconds / 2:
+            lagging = False
+            emit({"type": "backlog", "seconds": round(seconds, 1), "lagging": False})
 
-        rc = _FFMPEG.wait()
-        if rc not in (0, None):
-            tail = "\n".join(stderr_tail)
+    attempt = 0
+    received_ever = False
+    exit_code = 0
+
+    try:
+        while True:
+            rec_path = record_path_for(record_path, attempt)
+            proc, stderr_tail, ff_flags = spawn_ffmpeg(
+                build_ffmpeg_args(listen_url, rec_path, record_kind)
+            )
+            if attempt == 0:
+                emit({
+                    "type": "listening",
+                    "url": listen_url,
+                    "chunk_seconds": chunk_seconds,
+                    "sample_rate": SAMPLE_RATE,
+                    "record_path": rec_path,
+                })
+            reader = PcmReader(proc)
+
+            # The first connection may take as long as it takes (the user
+            # starts the job, then opens OBS). A *re*connect only gets the
+            # grace window before we call the session over.
+            deadline = None if attempt == 0 else time.monotonic() + grace
+            received = False
+
+            while True:
+                # Poll in short slices so signal handlers (pause/cancel) run
+                # promptly even while nothing is arriving.
+                data, eof = reader.drain(1.0)
+                if data:
+                    if not received:
+                        received = True
+                        received_ever = True
+                        if attempt == 0:
+                            emit({"type": "receiving"})
+                        else:
+                            emit({
+                                "type": "reconnected",
+                                "attempt": attempt,
+                                "record_path": rec_path,
+                            })
+                    buf.extend(data)
+                    if len(buf) > max_backlog_bytes:
+                        dropped = len(buf) - max_backlog_bytes
+                        del buf[:dropped]
+                        emit({
+                            "type": "backlog",
+                            "seconds": round(len(buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE), 1),
+                            "lagging": True,
+                            "dropped_seconds": round(dropped / (SAMPLE_RATE * BYTES_PER_SAMPLE), 1),
+                        })
+                    while len(buf) >= chunk_bytes:
+                        t0 = chunk_index * chunk_seconds
+                        pcm = bytes(buf[:chunk_bytes])
+                        del buf[:chunk_bytes]
+                        chunk_index += 1
+                        transcribe_chunk(pcm, t0)
+                        report_backlog()
+                    continue
+                if eof:
+                    break
+                if not received and deadline is not None and time.monotonic() > deadline:
+                    break  # grace expired, nobody came back
+
+            # Audio is not continuous across a reconnect, so flush whatever
+            # is left (if it's worth transcribing) and start the next
+            # connection with an empty buffer.
+            if len(buf) >= SAMPLE_RATE * BYTES_PER_SAMPLE:
+                transcribe_chunk(bytes(buf), chunk_index * chunk_seconds)
+                chunk_index += 1
+            buf.clear()
+            lagging = False
+
+            if not received and proc.poll() is None:
+                # Nobody ever connected on this attempt, so there is no
+                # recording to finalize — don't sit through the polite wait.
+                ff_flags["quiet"] = True
+                proc.terminate()
+            _terminate_ffmpeg()
+            rc = proc.wait()
+
+            if not received:
+                # Never got a single byte on this attempt: either ffmpeg
+                # failed outright (bad URL, port in use → rc=195/234) or the
+                # grace window expired with no reconnect.
+                if rc not in (0, None) and not received_ever:
+                    tail = "\n".join(stderr_tail)
+                    emit({
+                        "type": "error",
+                        "message": f"ffmpeg exited rc={rc}" + (f"\n{tail}" if tail else ""),
+                        "ffmpeg_stderr": tail,
+                        "rc": rc,
+                    })
+                    exit_code = 1
+                break
+
+            if grace <= 0 or _STOPPING:
+                break
+
             emit({
-                "type": "error",
-                "message": f"ffmpeg exited rc={rc}" + (f"\n{tail}" if tail else ""),
-                "ffmpeg_stderr": tail,
+                "type": "disconnected",
+                "attempt": attempt,
+                "grace_seconds": grace,
                 "rc": rc,
             })
-            sys.exit(1)
-        emit({"type": "done"})
+            attempt += 1
+            # Give the OS a moment to release the listen socket before the
+            # next ffmpeg tries to bind it.
+            time.sleep(0.3)
+
+        if exit_code == 0:
+            emit({"type": "done"})
     except Exception as exc:
         emit({"type": "error", "message": str(exc)})
-        sys.exit(1)
+        exit_code = 1
     finally:
         _terminate_ffmpeg()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

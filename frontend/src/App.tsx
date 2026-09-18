@@ -1013,7 +1013,8 @@ function NewJob({ onCreated, defaultOutputsDir }: {
                 <Typography variant="body2">
                   <strong>{selectedModel.id}</strong> 在 CPU 上約需 {selectedModel.rtf}× 實時
                   （轉 1 秒音訊要花 {selectedModel.rtf} 秒），比串流進來的速度還慢——
-                  <strong>不論 chunk 秒數設多少都會愈落後愈多</strong>，直到記憶體被待處理音訊塞爆。
+                  <strong>不論 chunk 秒數設多少都會愈落後愈多</strong>（來不及轉的音訊會先在記憶體排隊，
+                  超過上限就會丟掉最舊的那段）。
                   直播請用 <strong>{fasterLiveModel}</strong>；{selectedModel.id} 留給事後轉檔案。
                 </Typography>
               </Alert>
@@ -1255,6 +1256,11 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [receiving, setReceiving] = useState<boolean>(false)
   const [recordPath, setRecordPath] = useState<string | null>(null)
   const [recordKind, setRecordKind] = useState<'audio' | 'video' | null>(null)
+  // Live-only: the stream dropped and the worker is holding the port open for
+  // OBS to reconnect, and how far whisper is behind the incoming audio.
+  const [waitingReconnect, setWaitingReconnect] = useState<boolean>(false)
+  const [reconnects, setReconnects] = useState<number>(0)
+  const [backlog, setBacklog] = useState<number>(0)
   const [outputPath, setOutputPath] = useState<string | null>(null)
   const [openingDir, setOpeningDir] = useState(false)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
@@ -1263,6 +1269,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
 
   useEffect(() => {
     setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false); setReceiving(false)
+    setWaitingReconnect(false); setReconnects(0); setBacklog(0)
     fetch(`/api/jobs/${jobId}`).then((r) => r.json()).then((j) => {
       setFilename(j.filename || '')
       setLive(!!j.live)
@@ -1293,7 +1300,14 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
             if (ev.type === 'estimate') setEstimate(ev)
             else if (ev.type === 'info') setInfo(ev)
             else if (ev.type === 'listening') setListening(true)
-            else if (ev.type === 'receiving') setReceiving(true)
+            else if (ev.type === 'receiving') { setReceiving(true); setWaitingReconnect(false) }
+            else if (ev.type === 'disconnected') setWaitingReconnect(true)
+            else if (ev.type === 'reconnected') {
+              setWaitingReconnect(false)
+              setReconnects((n) => n + 1)
+              if (ev.record_path) setRecordPath(ev.record_path)
+            }
+            else if (ev.type === 'backlog') setBacklog(ev.lagging ? ev.seconds : 0)
             else if (ev.type === 'segment') setSegments((prev) => [...prev, ev])
             else if (ev.type === 'state') {
               setStatus(ev.status)
@@ -1492,18 +1506,30 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
               : status === 'cancelled'
                 ? '（🛑 已手動停止）'
                 : receiving
-                  ? '（🛑 OBS 已中斷，串流結束）'
+                  ? '（🛑 OBS 已中斷且未在寬限期內重連，串流結束）'
                   : '（已結束，未收到任何音訊）'
-            : receiving
-              ? '（🎧 已接收到 OBS 音訊串流）'
-              : listening
-                ? '（已就緒，等待 OBS 連入或音訊…）'
-                : '（啟動中，模型載入後會開始監聽）'}
+            : waitingReconnect
+              ? '（⏳ OBS 已中斷，監聽埠仍開著，等待重新連線…）'
+              : receiving
+                ? '（🎧 已接收到 OBS 音訊串流）'
+                : listening
+                  ? '（已就緒，等待 OBS 連入或音訊…）'
+                  : '（啟動中，模型載入後會開始監聽）'}
+          {reconnects > 0 && (
+            <Box sx={{ mt: 0.5 }}>🔁 已重新連線 {reconnects} 次（每次重連的錄影／錄音會另存成編號檔）</Box>
+          )}
           {recordPath && (
             <Box sx={{ mt: 0.5 }}>
               {recordKind === 'audio' ? '🎙️ 同步錄音' : '🎬 同步錄影'}：<code>{recordPath}</code>
             </Box>
           )}
+        </Alert>
+      )}
+      {live && isActive && backlog > 0 && (
+        <Alert severity="warning" variant="outlined">
+          ⚠️ 轉錄跟不上串流，目前落後約 {Math.round(backlog)} 秒的音訊。
+          串流本身不受影響（不會再被拖慢或斷線），但逐字稿會延遲；
+          落後持續增加時請改用更快的模型或加大 chunk 秒數。
         </Alert>
       )}
       {estimate && !info && (
