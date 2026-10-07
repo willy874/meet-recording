@@ -27,12 +27,15 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
-MODEL_SIZE = os.environ.get("WHISPER_MODEL", "medium")
+MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
+# Live jobs get their own default: large models run slower than real time on
+# CPU and can never keep up with a stream, so file and live can't share one.
+LIVE_MODEL_SIZE = os.environ.get("WHISPER_LIVE_MODEL", "small")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
 
 # Selectable Whisper models, ordered small → large. Each job picks one; the
-# env default above is only the pre-selected value in the UI/CLI.
+# env defaults above are only the pre-selected values in the UI/CLI.
 #
 # `rtf` is the CPU-int8 real-time factor used for ETA — seconds of compute per
 # second of audio. `live_chunk` is the smallest live chunk that still keeps up,
@@ -45,16 +48,16 @@ COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE", "int8")
 MODEL_CATALOG: dict[str, dict] = {
     "tiny":     {"params": "39M",   "size": "75 MB",  "rtf": 0.08, "live_chunk": 4,  "live_viable": True,  "note": "最快，準度低"},
     "base":     {"params": "74M",   "size": "145 MB", "rtf": 0.12, "live_chunk": 5,  "live_viable": True,  "note": "快，準度普通"},
-    "small":    {"params": "244M",  "size": "480 MB", "rtf": 0.25, "live_chunk": 8,  "live_viable": True,  "note": "速度與準度折衷"},
-    "medium":   {"params": "769M",  "size": "1.5 GB", "rtf": 0.6,  "live_chunk": 15, "live_viable": True,  "note": "預設，直播用這個"},
+    "small":    {"params": "244M",  "size": "480 MB", "rtf": 0.25, "live_chunk": 8,  "live_viable": True,  "note": "速度與準度折衷，直播預設"},
+    "medium":   {"params": "769M",  "size": "1.5 GB", "rtf": 0.6,  "live_chunk": 15, "live_viable": True,  "note": "準度較好，直播仍跟得上"},
     "large-v2": {"params": "1550M", "size": "2.9 GB", "rtf": 1.7,  "live_chunk": 20, "live_viable": False, "note": "高準度，僅適合轉檔案"},
-    "large-v3": {"params": "1550M", "size": "2.9 GB", "rtf": 1.9,  "live_chunk": 20, "live_viable": False, "note": "最準，僅適合轉檔案"},
+    "large-v3": {"params": "1550M", "size": "2.9 GB", "rtf": 1.9,  "live_chunk": 20, "live_viable": False, "note": "最準，轉檔案預設"},
 }
 
 
-# Default live chunk size. Matches `medium`'s `live_chunk` above — the default
-# model — so a live job started with everything untouched already keeps up with
-# the stream instead of falling behind and warning.
+# Default live chunk size. At or above the `live_chunk` of `small` (the live
+# default) and `medium`, so a live job started with everything untouched
+# already keeps up with the stream instead of falling behind and warning.
 DEFAULT_CHUNK_SECONDS = 15.0
 
 
@@ -228,7 +231,7 @@ def cancel_model_download(model: str) -> dict:
     return {"status": "cancelled"}
 
 
-def resolve_model(raw: Optional[str]) -> str:
+def resolve_model(raw: Optional[str], default: str = MODEL_SIZE) -> str:
     """Validate a per-job model override, falling back to the configured default.
 
     Unknown names are rejected rather than passed through: an unrecognised
@@ -236,7 +239,7 @@ def resolve_model(raw: Optional[str]) -> str:
     already been created and the UI has switched to the detail view.
     """
     if raw is None or not raw.strip():
-        return MODEL_SIZE
+        return default
     name = raw.strip()
     if name not in MODEL_CATALOG:
         raise HTTPException(400, f"unknown model: {name}")
@@ -456,9 +459,19 @@ _WORKER_IO_EXECUTOR = ThreadPoolExecutor(
 )
 
 
+# Emitted several times a second for the live waveform. Replaying a whole
+# meeting's worth of these to every new subscriber would be absurd, so they
+# go straight to current subscribers and are never kept.
+_TRANSIENT_EVENT_TYPES = {"level"}
+
+
 def _emit(job: Job, event: dict) -> None:
-    job.events.append(event)
+    # Wall-clock stamp so a client joining (or re-joining) mid-job can rebuild
+    # elapsed recording / processing time from the replayed history.
+    event.setdefault("ts", time.time())
     t = event.get("type")
+    if t not in _TRANSIENT_EVENT_TYPES:
+        job.events.append(event)
     if t == "segment":
         job.segments.append(event)
     elif t == "estimate":
@@ -618,7 +631,8 @@ async def _run_live_job(job: Job) -> None:
 def health() -> dict:
     return {
         "ok": True,
-        "model": MODEL_SIZE, "device": DEVICE, "compute": COMPUTE_TYPE,
+        "model": MODEL_SIZE, "live_model": LIVE_MODEL_SIZE,
+        "device": DEVICE, "compute": COMPUTE_TYPE,
         "models": list(MODEL_CATALOG),
         "outputs_dir": str(get_outputs_dir()),
         "default_live_listen_url": DEFAULT_LIVE_LISTEN_URL,
@@ -634,6 +648,7 @@ def list_models() -> dict:
     """
     return {
         "default": MODEL_SIZE,
+        "live_default": LIVE_MODEL_SIZE,
         "device": DEVICE,
         "compute": COMPUTE_TYPE,
         "models": [_model_entry(name, meta) for name, meta in MODEL_CATALOG.items()],
@@ -977,7 +992,7 @@ async def create_live_job(
     output_dir: Optional[str] = Form(None),
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
-    model_name = resolve_model(model)
+    model_name = resolve_model(model, LIVE_MODEL_SIZE)
     try:
         base_dir = resolve_job_base_dir(output_dir)
     except OSError as exc:

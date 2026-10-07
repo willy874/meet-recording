@@ -68,6 +68,24 @@ MAX_BACKLOG_SECONDS = float(os.environ.get("MEET_LIVE_MAX_BACKLOG", "600"))
 
 READ_SIZE = 65536
 
+# --- Audio level monitoring ---------------------------------------------
+# Measured on the same PCM whisper consumes, so "silent" here means the
+# transcript *will* be empty. The case this exists for: an OBS audio source
+# that quietly stops delivering samples (macOS ScreenCaptureKit does this
+# when the default output device changes mid-stream, e.g. headphones connect)
+# while video keeps flowing — the stream looks perfectly healthy otherwise.
+LEVEL_WINDOW_SECONDS = 0.1
+LEVEL_EMIT_INTERVAL = 0.25
+# Never ship more than this many windows in one event; a long transcribe
+# blocks the drain loop and would otherwise release a huge backlog at once.
+LEVEL_MAX_WINDOWS = 100
+# ~-50 dBFS. Room tone sits well above this; a dead capture is exactly 0.
+SILENCE_PEAK = float(os.environ.get("MEET_LIVE_SILENCE_PEAK", "0.003"))
+SILENCE_ALERT_SECONDS = float(os.environ.get("MEET_LIVE_SILENCE_ALERT", "5"))
+# Counted in whole windows: accumulating 0.1 in a float drifts, and the
+# threshold would land a window or more late.
+SILENCE_ALERT_WINDOWS = max(1, round(SILENCE_ALERT_SECONDS / LEVEL_WINDOW_SECONDS))
+
 
 def resolve_language(lang):
     if lang == "auto":
@@ -175,6 +193,87 @@ class PcmReader:
             data = b"".join(self._chunks)
             self._chunks.clear()
             return data, (self._eof and not data)
+
+
+class LevelMeter:
+    """Turns the PCM stream into a waveform feed plus a silence watchdog.
+
+    Windows are counted in *audio* time, not wall time, so a stalled stream
+    can never be mistaken for silence — that case is already reported as
+    ``disconnected``. Silence here means the stricter, more confusing thing:
+    bytes keep arriving and every one of them is zero.
+    """
+
+    def __init__(self) -> None:
+        self._win_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * LEVEL_WINDOW_SECONDS)
+        self._residue = bytearray()
+        self._peaks: list[float] = []
+        self._rms: list[float] = []
+        self._last_emit = 0.0
+        self._silent_windows = 0
+        self.alerting = False
+
+    @property
+    def silent_seconds(self) -> float:
+        return round(self._silent_windows * LEVEL_WINDOW_SECONDS, 1)
+
+    def reset(self) -> None:
+        self._residue.clear()
+        self._peaks.clear()
+        self._rms.clear()
+        self._silent_windows = 0
+        self.alerting = False
+
+    def feed(self, data: bytes) -> None:
+        self._residue.extend(data)
+        windows = len(self._residue) // self._win_bytes
+        if not windows:
+            return
+        take = windows * self._win_bytes
+        block = np.frombuffer(bytes(self._residue[:take]), dtype=np.int16)
+        del self._residue[:take]
+        frames = block.reshape(windows, -1).astype(np.float32) / 32768.0
+        peaks = np.abs(frames).max(axis=1)
+        rms = np.sqrt((frames ** 2).mean(axis=1))
+        self._peaks.extend(round(float(p), 4) for p in peaks)
+        self._rms.extend(round(float(r), 4) for r in rms)
+        del self._peaks[:-LEVEL_MAX_WINDOWS]
+        del self._rms[:-LEVEL_MAX_WINDOWS]
+        # Only the run *ending* at the newest window matters, so find the last
+        # audible window in this block and count what follows it.
+        audible = np.nonzero(peaks >= SILENCE_PEAK)[0]
+        if audible.size:
+            self._silent_windows = int(windows - 1 - audible[-1])
+        else:
+            self._silent_windows += windows
+
+    def due(self, now: float) -> bool:
+        return bool(self._peaks) and now - self._last_emit >= LEVEL_EMIT_INTERVAL
+
+    def take(self, now: float) -> dict:
+        """The waveform event. Transient — the parent must not log it."""
+        event = {
+            "type": "level",
+            "window_seconds": LEVEL_WINDOW_SECONDS,
+            "peaks": list(self._peaks),
+            "rms": list(self._rms),
+            "silent_seconds": self.silent_seconds,
+        }
+        self._peaks.clear()
+        self._rms.clear()
+        self._last_emit = now
+        return event
+
+    def silence_event(self) -> Optional[dict]:
+        """Durable event, emitted only when the silent/audible state flips."""
+        if not self.alerting and self._silent_windows >= SILENCE_ALERT_WINDOWS:
+            self.alerting = True
+            return {"type": "audio_silent", "silent": True,
+                    "seconds": self.silent_seconds}
+        if self.alerting and self._silent_windows == 0:
+            self.alerting = False
+            return {"type": "audio_silent", "silent": False, "seconds": 0.0}
+        return None
 
 
 def build_ffmpeg_args(listen_url: str, record_path: Optional[str], record_kind: str) -> list[str]:
@@ -310,6 +409,7 @@ def main():
     chunk_index = 0
     buf = bytearray()
     lagging = False
+    meter = LevelMeter()
 
     def transcribe_chunk(pcm: bytes, t0: float) -> None:
         nonlocal info_emitted
@@ -377,6 +477,11 @@ def main():
                     "record_path": rec_path,
                 })
             reader = PcmReader(proc)
+            # A fresh connection starts audible until proven otherwise; clear
+            # a standing alert so the UI doesn't inherit the last attempt's.
+            if meter.alerting:
+                emit({"type": "audio_silent", "silent": False, "seconds": 0.0})
+            meter.reset()
 
             # The first connection may take as long as it takes (the user
             # starts the job, then opens OBS). A *re*connect only gets the
@@ -401,6 +506,15 @@ def main():
                                 "record_path": rec_path,
                             })
                     buf.extend(data)
+                    # Before the transcribe loop below, which can block for
+                    # many seconds — the meter must stay live while it does.
+                    meter.feed(data)
+                    now = time.monotonic()
+                    if meter.due(now):
+                        emit(meter.take(now))
+                    silence = meter.silence_event()
+                    if silence:
+                        emit(silence)
                     if len(buf) > max_backlog_bytes:
                         dropped = len(buf) - max_backlog_bytes
                         del buf[:dropped]

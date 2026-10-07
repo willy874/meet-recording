@@ -876,7 +876,10 @@ def run_json(args, host: str, port: int) -> int:
     out_fh = open(args.output, "w", encoding="utf-8") if args.output else None
     try:
         for event in stream_job_events(host, port, job_id):
-            print(json.dumps(event, ensure_ascii=False), flush=True)
+            # The waveform feed is for the web UI; it would drown a pipeline.
+            # `audio_silent` carries the same warning at 2 events per outage.
+            if event.get("type") != "level":
+                print(json.dumps(event, ensure_ascii=False), flush=True)
             if event.get("type") == "segment" and out_fh:
                 out_fh.write(event["text"] + "\n"); out_fh.flush()
             elif event.get("type") == "error":
@@ -915,7 +918,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-vad", action="store_true", help="Disable VAD silence filtering")
     p.add_argument("--beam-size", type=int, default=5, help="Beam search size (default 5)")
     p.add_argument("-m", "--model", default=None, choices=list(MODEL_CHOICES),
-                   help="Whisper model for this job (default: backend's WHISPER_MODEL, normally medium). "
+                   help="Whisper model for this job (default: backend's WHISPER_MODEL, normally large-v3; "
+                        "with --live, WHISPER_LIVE_MODEL, normally small). "
                         "Larger = more accurate but slower; for --live see --chunk-seconds.")
     p.add_argument("-o", "--output", default=None, help="Write final transcript to this file (text)")
     p.add_argument("--host", default=DEFAULT_HOST, help=f"Backend host (default {DEFAULT_HOST})")
@@ -984,7 +988,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Like --outputs-dir, this only applies to a backend we start
         # ourselves — attaching to a running one leaves its default alone.
         extra = getattr(args, "_extra_backend_env", None) or {}
-        extra["WHISPER_MODEL"] = args.model
+        extra["WHISPER_LIVE_MODEL" if args.live else "WHISPER_MODEL"] = args.model
         args._extra_backend_env = extra
     if args.serve:
         # Default to also bringing up the web UI in serve mode — that's the whole point.

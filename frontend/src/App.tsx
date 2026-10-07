@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { RefObject } from 'react'
 import {
   AppBar, Toolbar, Typography, Container, Box, Stack, Card, CardContent,
   Button, IconButton, TextField, MenuItem, Select, FormControlLabel, Checkbox,
@@ -21,6 +22,7 @@ import StorageIcon from '@mui/icons-material/Storage'
 import LightModeIcon from '@mui/icons-material/LightMode'
 import DarkModeIcon from '@mui/icons-material/DarkMode'
 import SettingsBrightnessIcon from '@mui/icons-material/SettingsBrightness'
+import { useTheme } from '@mui/material/styles'
 import { statusColor } from './theme'
 
 type Segment = { start: number; end: number; text: string }
@@ -73,6 +75,23 @@ const formatDuration = (s: number) => {
   const h = Math.floor(m / 60)
   return `${h}h ${m % 60}m`
 }
+
+// Clock time, always with hours so a running timer doesn't change width.
+const formatClock = (s: number) => {
+  const t = Math.max(0, Math.floor(s))
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(Math.floor(t / 3600))}:${pad(Math.floor((t % 3600) / 60))}:${pad(t % 60)}`
+}
+
+// Pausable stopwatch over backend event timestamps (unix seconds). `since` is
+// set while running; finished stretches fold into `accum`.
+type Stopwatch = { accum: number; since: number | null }
+const STOPWATCH_ZERO: Stopwatch = { accum: 0, since: null }
+const swStart = (w: Stopwatch, ts: number): Stopwatch => (w.since === null ? { ...w, since: ts } : w)
+const swStop = (w: Stopwatch, ts: number): Stopwatch =>
+  w.since === null ? w : { accum: w.accum + Math.max(0, ts - w.since), since: null }
+const swRead = (w: Stopwatch, now: number) => w.accum + (w.since === null ? 0 : Math.max(0, now - w.since))
+const TERMINAL_STATUSES = ['done', 'error', 'cancelled']
 
 export default function App() {
   const [jobs, setJobs] = useState<JobSummary[]>([])
@@ -462,14 +481,15 @@ const NEWJOB_PREFS_KEY = 'meet.newjob.prefs.v1'
 // Prefs saved under an older rev get the changed fields reset (see
 // loadNewJobPrefs) — otherwise every returning browser keeps the old default
 // forever, since prefs are re-saved on each job.
-const NEWJOB_PREFS_REV = 2
-// Live chunk size. 15s matches the `medium` model's recommended minimum, so
-// the default combo keeps up with the stream out of the box.
+const NEWJOB_PREFS_REV = 3
+// Live chunk size. 15s is at or above the recommended minimum of `small` (the
+// live default) and `medium`, so the default combo keeps up out of the box.
 const DEFAULT_CHUNK_SECONDS = 15
 type NewJobPrefs = {
   mode: 'file' | 'live'
   language: string
   model: string
+  liveModel: string
   vad: boolean
   listenUrl: string
   chunkSeconds: number
@@ -486,8 +506,10 @@ const NEWJOB_DEFAULTS: NewJobPrefs = {
   language: 'auto',
   // Empty = "whatever the backend reports as default"; filled in once
   // /api/models resolves, so we never hard-code a model the backend may
-  // have overridden via WHISPER_MODEL.
+  // have overridden via WHISPER_MODEL. File and live keep separate choices
+  // (and separate backend defaults): large models can't keep up with a stream.
   model: '',
+  liveModel: '',
   vad: true,
   listenUrl: 'tcp://0.0.0.0:9999?listen=1',
   chunkSeconds: DEFAULT_CHUNK_SECONDS,
@@ -507,17 +529,21 @@ const loadNewJobPrefs = (): NewJobPrefs => {
     // rev 1 → 2 raised the default chunk size; adopt it instead of carrying
     // the stale 6s forward. Everything else the user set is kept.
     if ((stored.rev ?? 1) < 2) delete stored.chunkSeconds
+    // rev 2 → 3 split the model into file (large-v3) / live (small) defaults;
+    // drop the old shared pick so both adopt the new backend defaults.
+    if ((stored.rev ?? 1) < 3) delete stored.model
     return { ...NEWJOB_DEFAULTS, ...stored, rev: NEWJOB_PREFS_REV }
   } catch {
     return NEWJOB_DEFAULTS
   }
 }
 
-function ModelManager({ open, onClose, models, defaultModel, onChanged }: {
+function ModelManager({ open, onClose, models, defaultModel, liveDefaultModel, onChanged }: {
   open: boolean
   onClose: () => void
   models: ModelInfo[]
   defaultModel: string
+  liveDefaultModel: string
   onChanged: () => void
 }) {
   const [busy, setBusy] = useState<string | null>(null)
@@ -557,7 +583,8 @@ function ModelManager({ open, onClose, models, defaultModel, onChanged }: {
                   <Box sx={{ flex: 1, minWidth: 0 }}>
                     <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
                       <Typography sx={{ fontWeight: 500 }}>{m.id}</Typography>
-                      {m.id === defaultModel && <Chip size="small" label="預設" />}
+                      {m.id === defaultModel && <Chip size="small" label="轉檔預設" />}
+                      {m.id === liveDefaultModel && <Chip size="small" label="直播預設" />}
                       {m.cached
                         ? <Chip size="small" color="success" label={`已下載 · ${formatBytes(m.disk_bytes)}`} />
                         : <Chip
@@ -678,9 +705,13 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const [files, setFiles] = useState<File[]>([])
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
   const [language, setLanguage] = useState(initial.language)
-  const [model, setModel] = useState(initial.model)
+  const [fileModel, setFileModel] = useState(initial.model)
+  const [liveModel, setLiveModel] = useState(initial.liveModel)
+  const model = mode === 'live' ? liveModel : fileModel
+  const setModel = mode === 'live' ? setLiveModel : setFileModel
   const [models, setModels] = useState<ModelInfo[]>([])
   const [backendDefaultModel, setBackendDefaultModel] = useState('')
+  const [backendLiveDefaultModel, setBackendLiveDefaultModel] = useState('')
   const [vad, setVad] = useState(initial.vad)
   const [listenUrl, setListenUrl] = useState(initial.listenUrl)
   const [chunkSeconds, setChunkSeconds] = useState(initial.chunkSeconds)
@@ -704,9 +735,13 @@ function NewJob({ onCreated, defaultOutputsDir }: {
       if (!r.ok) return
       const data = await r.json()
       setModels(data.models ?? [])
-      setBackendDefaultModel((data.default as string) || '')
-      // Only adopt the backend default when the user has no stored choice.
-      setModel((cur) => cur || (data.default as string) || '')
+      const fileDefault = (data.default as string) || ''
+      const liveDefault = (data.live_default as string) || fileDefault
+      setBackendDefaultModel(fileDefault)
+      setBackendLiveDefaultModel(liveDefault)
+      // Only adopt the backend defaults when the user has no stored choice.
+      setFileModel((cur) => cur || fileDefault)
+      setLiveModel((cur) => cur || liveDefault)
     } catch { /* offline backend — the Select just stays empty */ }
   }
 
@@ -795,7 +830,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
 
   const persistPrefs = () => {
     const prefs: NewJobPrefs = {
-      mode, language, model, vad, listenUrl, chunkSeconds, label,
+      mode, language, model: fileModel, liveModel, vad, listenUrl, chunkSeconds, label,
       record, recordKind, recordAudioFormat, recordVideoFormat,
       outputDir, rev: NEWJOB_PREFS_REV,
     }
@@ -810,7 +845,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   const liveTooSlow = mode === 'live' && selectedModel !== null && !selectedModel.live_viable
   const chunkTooShort = mode === 'live' && selectedModel !== null
     && selectedModel.live_viable && chunkSeconds < selectedModel.live_chunk
-  const fasterLiveModel = models.find((m) => m.live_viable && m.cached)?.id ?? 'medium'
+  const fasterLiveModel = models.find((m) => m.live_viable && m.cached)?.id ?? (backendLiveDefaultModel || 'small')
 
   const handleStartFile = async () => {
     if (files.length === 0 || submitting) return
@@ -1044,7 +1079,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
               label="同步保留原始檔（存到 outputs/）"
             />
             {record && (
-              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems={{ sm: 'center' }}>
+              <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2, alignItems: { sm: 'center' } }}>
                 <ToggleButtonGroup
                   size="small"
                   exclusive
@@ -1081,7 +1116,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
                     </Select>
                   </FormControl>
                 )}
-              </Stack>
+              </Box>
             )}
             <Alert severity="info" variant="outlined">
               <Typography variant="body2" component="div">
@@ -1178,6 +1213,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
           onClose={() => setManageOpen(false)}
           models={models}
           defaultModel={backendDefaultModel}
+          liveDefaultModel={backendLiveDefaultModel}
           onChanged={refreshModels}
         />
 
@@ -1239,6 +1275,105 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   )
 }
 
+// ~24 s of history at 100 ms per window.
+const LEVEL_HISTORY = 240
+// Mirrors SILENCE_PEAK in live_worker.py — bars under this are what the
+// backend's watchdog counts as silence.
+const LEVEL_SILENT_PEAK = 0.003
+
+type LevelState = { peaks: number[]; rms: number[]; silentSeconds: number; version: number }
+
+/** Rolling waveform of the PCM that actually reaches whisper.
+ *
+ *  Levels arrive ~4x/s. Putting them in React state would re-render the whole
+ *  transcript that often, so the SSE handler pushes them into a ref and this
+ *  component paints from an animation frame, redrawing only on new data.
+ */
+function AudioMeter({ levels }: { levels: RefObject<LevelState> }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const theme = useTheme()
+
+  useEffect(() => {
+    let raf = 0
+    let drawn = -1
+    // -60 dBFS reads as the floor; a linear scale would leave speech
+    // (peaks around 0.1–0.5) hugging the bottom of the meter.
+    const norm = (v: number) => Math.max(0, Math.min(1, (20 * Math.log10(Math.max(v, 1e-4)) + 60) / 60))
+
+    const draw = () => {
+      raf = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const state = levels.current
+      if (!canvas || !state || state.version === drawn) return
+      drawn = state.version
+
+      const dpr = window.devicePixelRatio || 1
+      const w = canvas.clientWidth
+      const h = canvas.clientHeight
+      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr)
+        canvas.height = Math.round(h * dpr)
+      }
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, w, h)
+
+      const mid = h / 2
+      ctx.strokeStyle = theme.palette.divider
+      ctx.lineWidth = 1
+      ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke()
+
+      const barW = 3
+      const gap = 1
+      const slots = Math.max(1, Math.floor(w / (barW + gap)))
+      const peaks = state.peaks.slice(-slots)
+      const rms = state.rms.slice(-slots)
+      // Newest bar pinned to the right edge, so the trace scrolls leftwards.
+      const x0 = w - peaks.length * (barW + gap)
+
+      for (let i = 0; i < peaks.length; i++) {
+        const x = x0 + i * (barW + gap)
+        const ph = Math.max(1, norm(peaks[i]) * (mid - 2))
+        // Per-bar, not per-panel: a red tail against a blue body shows at a
+        // glance exactly when the audio died, which a uniform tint hides.
+        ctx.fillStyle = peaks[i] < LEVEL_SILENT_PEAK
+          ? theme.palette.error.main
+          : theme.palette.primary.main
+        ctx.globalAlpha = 0.35
+        ctx.fillRect(x, mid - ph, barW, ph * 2)
+        const rh = Math.max(1, norm(rms[i]) * (mid - 2))
+        ctx.globalAlpha = 1
+        ctx.fillRect(x, mid - rh, barW, rh * 2)
+      }
+      ctx.globalAlpha = 1
+
+      // Live silence counter, so a dropout is visible well before the
+      // 5-second alert fires.
+      if (state.silentSeconds >= 1) {
+        const label = `靜音 ${state.silentSeconds.toFixed(1)} 秒`
+        ctx.font = '12px system-ui, sans-serif'
+        ctx.textAlign = 'right'
+        ctx.textBaseline = 'top'
+        // Tucked into the top-right on its own plate: the trace runs through
+        // the vertical middle, and a flat line is exactly when this shows.
+        const tw = ctx.measureText(label).width
+        ctx.globalAlpha = 0.85
+        ctx.fillStyle = theme.palette.background.paper
+        ctx.fillRect(w - tw - 10, 1, tw + 9, 17)
+        ctx.globalAlpha = 1
+        ctx.fillStyle = theme.palette.error.main
+        ctx.fillText(label, w - 6, 4)
+      }
+    }
+
+    raf = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(raf)
+  }, [levels, theme])
+
+  return <canvas ref={canvasRef} style={{ width: '100%', height: 64, display: 'block' }} />
+}
+
 function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   jobId: string
   onChange: () => void
@@ -1261,15 +1396,26 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [waitingReconnect, setWaitingReconnect] = useState<boolean>(false)
   const [reconnects, setReconnects] = useState<number>(0)
   const [backlog, setBacklog] = useState<number>(0)
+  // Waveform samples live in a ref, not state — see AudioMeter. Only the
+  // silent/audible flip (a rare, durable event) is worth a re-render.
+  const levelsRef = useRef<LevelState>({ peaks: [], rms: [], silentSeconds: 0, version: 0 })
+  const [audioSilent, setAudioSilent] = useState<boolean>(false)
   const [outputPath, setOutputPath] = useState<string | null>(null)
   const [openingDir, setOpeningDir] = useState(false)
+  // Live: time OBS has actually been streaming in (reconnect gaps excluded).
+  // File: time the worker has spent transcribing (pauses excluded).
+  const [recClock, setRecClock] = useState<Stopwatch>(STOPWATCH_ZERO)
+  const [procClock, setProcClock] = useState<Stopwatch>(STOPWATCH_ZERO)
+  const [now, setNow] = useState(() => Date.now() / 1000)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const autoScrollRef = useRef(true)
   const sseAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false); setReceiving(false)
-    setWaitingReconnect(false); setReconnects(0); setBacklog(0)
+    setWaitingReconnect(false); setReconnects(0); setBacklog(0); setAudioSilent(false)
+    setRecClock(STOPWATCH_ZERO); setProcClock(STOPWATCH_ZERO)
+    levelsRef.current = { peaks: [], rms: [], silentSeconds: 0, version: 0 }
     fetch(`/api/jobs/${jobId}`).then((r) => r.json()).then((j) => {
       setFilename(j.filename || '')
       setLive(!!j.live)
@@ -1297,16 +1443,38 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
             const line = chunk.split('\n').find((l) => l.startsWith('data: '))
             if (!line) continue
             const ev = JSON.parse(line.slice(6))
+            // The synthetic state the backend appends after replay has no ts;
+            // only real, stamped events drive the timers.
+            if (typeof ev.ts === 'number') {
+              const ts = ev.ts as number
+              if (ev.type === 'receiving' || ev.type === 'reconnected') setRecClock((w) => swStart(w, ts))
+              else if (ev.type === 'disconnected') setRecClock((w) => swStop(w, ts))
+              else if (ev.type === 'state') {
+                if (ev.status === 'running') setProcClock((w) => swStart(w, ts))
+                else {
+                  setProcClock((w) => swStop(w, ts))
+                  if (TERMINAL_STATUSES.includes(ev.status)) setRecClock((w) => swStop(w, ts))
+                }
+              }
+            }
             if (ev.type === 'estimate') setEstimate(ev)
             else if (ev.type === 'info') setInfo(ev)
             else if (ev.type === 'listening') setListening(true)
             else if (ev.type === 'receiving') { setReceiving(true); setWaitingReconnect(false) }
-            else if (ev.type === 'disconnected') setWaitingReconnect(true)
+            else if (ev.type === 'disconnected') { setWaitingReconnect(true); setAudioSilent(false) }
             else if (ev.type === 'reconnected') {
               setWaitingReconnect(false)
               setReconnects((n) => n + 1)
               if (ev.record_path) setRecordPath(ev.record_path)
             }
+            else if (ev.type === 'level') {
+              const st = levelsRef.current
+              st.peaks = [...st.peaks, ...ev.peaks].slice(-LEVEL_HISTORY)
+              st.rms = [...st.rms, ...ev.rms].slice(-LEVEL_HISTORY)
+              st.silentSeconds = ev.silent_seconds
+              st.version++
+            }
+            else if (ev.type === 'audio_silent') setAudioSilent(!!ev.silent)
             else if (ev.type === 'backlog') setBacklog(ev.lagging ? ev.seconds : 0)
             else if (ev.type === 'segment') setSegments((prev) => [...prev, ev])
             else if (ev.type === 'state') {
@@ -1324,6 +1492,14 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
     return () => ctrl.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId])
+
+  const clockRunning = recClock.since !== null || procClock.since !== null
+  useEffect(() => {
+    if (!clockRunning) return
+    setNow(Date.now() / 1000)
+    const t = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(t)
+  }, [clockRunning])
 
   useEffect(() => {
     const el = transcriptRef.current
@@ -1347,6 +1523,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       sseAbortRef.current?.abort()
       setStatus('cancelled')
       setListening(false)
+      setRecClock((w) => swStop(w, Date.now() / 1000))
     }
     // For file jobs we still surface the (brief) cancel-pending state so the
     // user knows the worker is winding down — but we no longer block the UI
@@ -1371,7 +1548,14 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
 
   const lastEnd = segments.length ? segments[segments.length - 1].end : 0
   const progress = estimate && estimate.duration_seconds > 0 ? Math.min(1, lastEnd / estimate.duration_seconds) : 0
-  const remainingEta = estimate ? Math.max(0, estimate.eta_seconds * (1 - progress)) : 0
+  const recordedSeconds = swRead(recClock, now)
+  const processingSeconds = swRead(procClock, now)
+  // Model-based ETA until there's enough real throughput to extrapolate from.
+  const remainingEta = estimate
+    ? lastEnd >= 30 && processingSeconds > 0
+      ? Math.max(0, (processingSeconds / lastEnd) * (estimate.duration_seconds - lastEnd))
+      : Math.max(0, estimate.eta_seconds * (1 - progress))
+    : 0
   const fullText = segments.map((s) => s.text).join('\n')
   const handleCopy = () => navigator.clipboard.writeText(fullText)
 
@@ -1405,20 +1589,61 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
                 job: {jobId}
               </Typography>
             </Box>
-            <Chip
-              label={status}
-              color={statusColor(status) as 'primary' | 'success' | 'error' | 'warning' | 'default'}
-              sx={{ textTransform: 'uppercase', fontSize: 11 }}
-              size="small"
-            />
+            <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexShrink: 0 }}>
+              {live && (recClock.since !== null || recClock.accum > 0) && (
+                <Tooltip title="總錄製時間（OBS 實際串流進來的時間，不含斷線等待）">
+                  <Chip
+                    size="small"
+                    icon={<FiberManualRecordIcon />}
+                    label={formatClock(recordedSeconds)}
+                    color={recClock.since !== null ? 'error' : 'default'}
+                    variant={recClock.since !== null ? 'filled' : 'outlined'}
+                    sx={{ fontFamily: 'ui-monospace, monospace' }}
+                  />
+                </Tooltip>
+              )}
+              {!live && (procClock.since !== null || procClock.accum > 0) && (
+                <Tooltip title="已花費的轉錄時間（不含暫停）">
+                  <Chip
+                    size="small"
+                    label={`⏱ ${formatClock(processingSeconds)}`}
+                    variant="outlined"
+                    sx={{ fontFamily: 'ui-monospace, monospace' }}
+                  />
+                </Tooltip>
+              )}
+              <Chip
+                label={status}
+                color={statusColor(status) as 'primary' | 'success' | 'error' | 'warning' | 'default'}
+                sx={{ textTransform: 'uppercase', fontSize: 11 }}
+                size="small"
+              />
+            </Stack>
           </Stack>
 
           {isActive && estimate && (
-            <LinearProgress
-              variant="determinate"
-              value={progress * 100}
-              sx={{ height: 6, borderRadius: 3, mb: 2 }}
-            />
+            <Box sx={{ mb: 2 }}>
+              <LinearProgress
+                variant="determinate"
+                value={progress * 100}
+                sx={{ height: 6, borderRadius: 3 }}
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', mt: 0.5, fontFamily: 'ui-monospace, monospace' }}
+              >
+                已轉錄 {formatClock(lastEnd)} / {formatClock(estimate.duration_seconds)}
+                （{(progress * 100).toFixed(0)}%） · 已花 {formatClock(processingSeconds)}
+                {' '}· 剩餘 ~{formatDuration(remainingEta)}
+              </Typography>
+            </Box>
+          )}
+          {!live && status === 'done' && procClock.accum > 0 && (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+              轉錄完成，共花 {formatClock(procClock.accum)}
+              {estimate && ` · 音檔長度 ${formatClock(estimate.duration_seconds)}`}
+            </Typography>
           )}
 
           <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
@@ -1515,6 +1740,12 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
                 : listening
                   ? '（已就緒，等待 OBS 連入或音訊…）'
                   : '（啟動中，模型載入後會開始監聽）'}
+          {(recClock.since !== null || recClock.accum > 0) && (
+            <Box sx={{ mt: 0.5 }}>
+              ⏱️ 總錄製時間：<strong style={{ fontFamily: 'ui-monospace, monospace' }}>{formatClock(recordedSeconds)}</strong>
+              {waitingReconnect && '（斷線中，暫停計時）'}
+            </Box>
+          )}
           {reconnects > 0 && (
             <Box sx={{ mt: 0.5 }}>🔁 已重新連線 {reconnects} 次（每次重連的錄影／錄音會另存成編號檔）</Box>
           )}
@@ -1523,6 +1754,32 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
               {recordKind === 'audio' ? '🎙️ 同步錄音' : '🎬 同步錄影'}：<code>{recordPath}</code>
             </Box>
           )}
+        </Alert>
+      )}
+      {live && isActive && receiving && (
+        <Card variant="outlined">
+          <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
+              <Typography variant="caption" color="text.secondary">
+                收音監測 · 進到 whisper 的音訊波形（最近 24 秒）
+              </Typography>
+              <Chip
+                size="small"
+                label={audioSilent ? '無聲' : '有聲音'}
+                color={audioSilent ? 'error' : 'success'}
+                variant={audioSilent ? 'filled' : 'outlined'}
+              />
+            </Box>
+            <AudioMeter levels={levelsRef} />
+          </CardContent>
+        </Card>
+      )}
+      {live && isActive && audioSilent && (
+        <Alert severity="error" variant="outlined">
+          🔇 串流有進來，但音訊全是靜音——這段時間的逐字稿會是空的。
+          常見原因：OBS 的音訊來源停止供應樣本（macOS 的螢幕／應用程式音訊擷取在
+          輸出裝置變更時會這樣，例如剛接上耳機），或來源被靜音／推錯軌。
+          處理方式：對 OBS 該音訊來源按右鍵 →「屬性」→「確定」重建擷取，不必重開 OBS。
         </Alert>
       )}
       {live && isActive && backlog > 0 && (

@@ -11,6 +11,7 @@
 - 🗂 **檔案轉錄**：拖檔上傳，逐段 SSE 回傳；可暫停／繼續／中止；複製全文或下載 `.txt`
 - 🔴 **OBS 即時直播轉錄**：meet 跑 ffmpeg listener、OBS 推 TCP/UDP 過來，每 N 秒一段地轉
 - 🎬 **同步保留影片檔**：直播時可勾選同時把原串流 stream-copy 一份成 `mkv`/`mp4`/`ts`，**不重編、零 CPU 開銷**
+- 📊 **收音監測**：直播時畫出進到 whisper 的音訊波形，串流有進來卻整段靜音會直接跳警告
 - 🧠 **多語言**：`zh-TW`／`zh-CN`／`zh`／`en`／`ja`／`ko` 等，或 `auto` 自動偵測；繁／簡會自動帶 initial prompt 偏好正確字形
 - 🖥 **CLI 一鍵啟動**：`./meet-cli --serve --open` 把 backend + frontend 拉起來、自動開瀏覽器
 - 🔁 **CLI 與 Web 共享 jobs**：CLI 建立的任務在側欄看得到、可從 Web 控制；反之亦然
@@ -60,7 +61,7 @@ export PATH="$PWD:$PATH"          # 暫時；寫進 ~/.zshrc 永久
 # ln -sf "$PWD/meet-cli" /usr/local/bin/meet-cli
 ```
 
-**首次跑 Whisper 會下載模型**（預設 `medium`，約 1.5 GB），模型快取在 `~/.cache/huggingface/`。模型可以**逐一任務選擇**——Web UI 的「模型」下拉選單、CLI 的 `--model`；沒指定就用 `WHISPER_MODEL`。哪些已經下載好了，UI 會直接標示，也可以打 `GET /api/models` 查。詳見 [選擇模型](#選擇模型)。
+**首次跑 Whisper 會下載模型**（轉檔案預設 `large-v3` 約 2.9 GB，直播預設 `small` 約 480 MB），模型快取在 `~/.cache/huggingface/`。模型可以**逐一任務選擇**——Web UI 的「模型」下拉選單、CLI 的 `--model`；沒指定時，轉檔案用 `WHISPER_MODEL`、直播用 `WHISPER_LIVE_MODEL`。哪些已經下載好了，UI 會直接標示，也可以打 `GET /api/models` 查。詳見 [選擇模型](#選擇模型)。
 
 ---
 
@@ -171,6 +172,21 @@ OBS 中途斷掉（網路抖一下、你去改場景重開推流）不會結束�
 轉錄跟不上串流時**不會再拖慢或掐斷 OBS**：來不及轉的音訊排在 meet 的記憶體裡（上限
 `MEET_LIVE_MAX_BACKLOG` 秒，預設 600，超過丟最舊的），UI 會顯示落後幾秒。
 
+#### B-3c. 收音監測與靜音警告
+
+直播頁面會畫一條波形，量的就是**實際送進 whisper 的那份 PCM**——所以它顯示有聲音，
+逐字稿就一定有東西可以轉；它是平的，逐字稿就一定是空的。藍色是有訊號，紅色是靜音，
+歷史保留最近 24 秒，一眼就看得出聲音是從哪一刻斷掉的。
+
+連續靜音超過 `MEET_LIVE_SILENCE_ALERT` 秒（預設 5）會跳出警告。注意這跟「OBS 斷線」
+是兩回事：斷線會顯示「等待重新連線」，而這裡講的是**串流好好的、影格照送，但音訊全是 0**。
+最常見的原因是 OBS 的音訊來源停止供應樣本——macOS 的螢幕／應用程式音訊擷取
+（ScreenCaptureKit）在系統輸出裝置變更時就會這樣，例如串流途中接上藍牙耳機。
+解法不必重開 OBS：對該音訊來源按右鍵 →「屬性」→「確定」，擷取就會重建。
+
+CLI 的 `--json` 模式收得到 `audio_silent` 事件（靜音開始與結束各一筆），
+波形本身則不會印出去，以免洗版。
+
 #### B-4. 驗證連線（可選）
 
 在 terminal：
@@ -202,7 +218,7 @@ obs     ...  127.0.0.1:NNNNN->127.0.0.1:9999 (ESTABLISHED)
 
 ## 選擇模型
 
-模型是**每個任務各自決定**的：Web UI「新轉錄」表單裡的「模型」下拉（檔案轉錄與 OBS 直播都有），CLI 用 `--model`。後端的 `WHISPER_MODEL` 只決定預設值。
+模型是**每個任務各自決定**的：Web UI「新轉錄」表單裡的「模型」下拉（檔案轉錄與 OBS 直播都有），CLI 用 `--model`。後端的 `WHISPER_MODEL`（轉檔案）與 `WHISPER_LIVE_MODEL`（直播）只決定預設值。
 
 下拉選單會標示哪些模型還沒下載（含檔案大小）；選了沒下載的模型，任務開頭會先卡在下載，UI 會事先提醒。
 
@@ -212,12 +228,12 @@ obs     ...  127.0.0.1:NNNNN->127.0.0.1:9999 (ESTABLISHED)
 |------|------|-----|--------|------------------|
 | `tiny` | 75 MB | ~0.08 | 最快，準度低 | ✅ chunk 4s 以上 |
 | `base` | 145 MB | ~0.12 | 快 | ✅ chunk 5s 以上 |
-| `small` | 480 MB | ~0.25 | 折衷 | ✅ chunk 8s 以上 |
-| `medium` | 1.5 GB | ~0.6 | **預設** | ✅ **chunk 15s 以上** |
+| `small` | 480 MB | ~0.25 | 折衷 | ✅ **直播預設**，chunk 8s 以上 |
+| `medium` | 1.5 GB | ~0.6 | 較準 | ✅ chunk 15s 以上 |
 | `large-v2` | 2.9 GB | ~1.7 | 高準度 | ❌ 比實時慢 |
-| `large-v3` | 2.9 GB | ~1.9 | **最準** | ❌ 比實時慢 |
+| `large-v3` | 2.9 GB | ~1.9 | **轉檔案預設**，最準 | ❌ 比實時慢 |
 
-**簡單講：直播用 `medium`，事後轉檔案用 `large-v3`。**
+**簡單講：直播預設 `small`（想更準可換 `medium` + chunk 15s），事後轉檔案預設 `large-v3`。**
 
 ### 直播的 chunk 秒數怎麼選
 
@@ -232,7 +248,7 @@ obs     ...  127.0.0.1:NNNNN->127.0.0.1:9999 (ESTABLISHED)
 
 代價是延遲：一段字幕最晚會在說完後一個 chunk 才出現。`medium` 用 **15 秒**最平衡。
 
-這招救不了 `rtf > 1.0` 的模型。運算量隨音訊長度等比成長，所以 `large-v3` 不管 chunk 設 6/10/15/20 秒，比值都落在 1.83–2.14——延遲只會越積越多，不會收斂。CLI 會印 warning，Web UI 會跳紅色提示並提供一鍵換回 `medium`。
+這招救不了 `rtf > 1.0` 的模型。運算量隨音訊長度等比成長，所以 `large-v3` 不管 chunk 設 6/10/15/20 秒，比值都落在 1.83–2.14——延遲只會越積越多，不會收斂。CLI 會印 warning，Web UI 會跳紅色提示並提供一鍵換成可即時的模型。
 
 ## 同步保留影片檔（直播模式）
 
@@ -299,7 +315,8 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 
 | 變數 | 預設 | 說明 |
 |------|------|------|
-| `WHISPER_MODEL` | `medium` | **預設**模型；每個任務都可用 UI 的「模型」下拉或 CLI `--model` 個別覆寫 |
+| `WHISPER_MODEL` | `large-v3` | 轉檔案的**預設**模型；每個任務都可用 UI 的「模型」下拉或 CLI `--model` 個別覆寫 |
+| `WHISPER_LIVE_MODEL` | `small` | 直播的**預設**模型（必須比實時快，`large-*` 不行） |
 | `WHISPER_DEVICE` | `cpu` | 有 NVIDIA GPU 可改 `cuda` |
 | `WHISPER_COMPUTE` | `int8` | CPU 用 `int8` 最快；CUDA 建議 `float16` |
 | `PORT` | `7001` | 後端 port |
@@ -309,6 +326,8 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `MEET_LIVE_LISTEN_URL` | `tcp://0.0.0.0:9999?listen=1` | 直播 listener 預設 URL |
 | `MEET_LIVE_RECONNECT_GRACE` | `60` | 直播斷線後保留監聽埠等待重連的秒數；設 `0` 表示斷了就結束 |
 | `MEET_LIVE_MAX_BACKLOG` | `600` | 轉錄落後時最多在記憶體暫存幾秒音訊，超過就丟掉最舊的 |
+| `MEET_LIVE_SILENCE_ALERT` | `5` | 連續靜音幾秒後跳出「收不到聲音」警告 |
+| `MEET_LIVE_SILENCE_PEAK` | `0.003` | 判定為靜音的振幅門檻（約 -50 dBFS）；環境底噪會誤觸發時調高 |
 | `MEET_WEB_PORT` | `7002` | CLI `--web` 預設 port |
 
 ---
@@ -322,7 +341,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 ```json
 {
   "ok": true,
-  "model": "medium", "device": "cpu", "compute": "int8",
+  "model": "large-v3", "live_model": "small", "device": "cpu", "compute": "int8",
   "models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
   "outputs_dir": "/Users/you/code/meet/outputs",
   "default_live_listen_url": "tcp://0.0.0.0:9999?listen=1"
@@ -335,7 +354,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 
 ```json
 {
-  "default": "medium", "device": "cpu", "compute": "int8",
+  "default": "large-v3", "live_default": "small", "device": "cpu", "compute": "int8",
   "models": [
     {
       "id": "medium", "params": "769M", "size": "1.5 GB",
@@ -394,7 +413,7 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 | `vad` | bool | `true` | |
 | `beam_size` | int | `5` | |
 | `chunk_seconds` | float | `15.0` | 滾動 chunk 秒數 |
-| `model` | string | 後端 `WHISPER_MODEL` | 這個任務用的模型；不在清單內回 400 |
+| `model` | string | 後端 `WHISPER_LIVE_MODEL` | 這個任務用的模型；不在清單內回 400 |
 | `label` | string | — | 顯示標籤 |
 | `record` | bool | `false` | 是否同步保留影片檔 |
 | `record_format` | string | `mkv` | `mkv` / `mp4` / `ts` / `flv` / `mov` |
