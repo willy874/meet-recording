@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -59,6 +60,8 @@ MODEL_CATALOG: dict[str, dict] = {
 # default) and `medium`, so a live job started with everything untouched
 # already keeps up with the stream instead of falling behind and warning.
 DEFAULT_CHUNK_SECONDS = 15.0
+MIN_CHUNK_SECONDS = 1.0
+MAX_CHUNK_SECONDS = 300.0
 
 
 def live_chunk_hint(model: str) -> int:
@@ -417,6 +420,8 @@ class Job:
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     record_path: Optional[str] = None
     record_kind: Optional[str] = None  # "audio" | "video"
+    saved_at: float = 0.0  # monotonic time of the last _save_job
+    ffmpeg_log_count: int = 0
 
     def summary(self) -> dict:
         last_end = self.segments[-1]["end"] if self.segments else 0
@@ -464,13 +469,113 @@ _WORKER_IO_EXECUTOR = ThreadPoolExecutor(
 # go straight to current subscribers and are never kept.
 _TRANSIENT_EVENT_TYPES = {"level"}
 
+# ffmpeg repeats itself on a damaged stream (one line per bad packet), so an
+# hours-long live job could otherwise grow its replay history without bound.
+# Past this many lines, ffmpeg output still reaches live subscribers but is no
+# longer kept for replay or persisted.
+MAX_FFMPEG_LOG_EVENTS = 200
+
+
+# --- Job history on disk ---------------------------------------------------
+# Jobs live in memory, so a backend restart used to wipe the sidebar even
+# though every transcript was still on disk. Each job's metadata and replay
+# log is mirrored to CONFIG_DIR/jobs/{id}.json and reloaded at startup; a
+# worker's stderr goes to CONFIG_DIR/logs/{id}.log so a crash is explainable.
+# Both live under CONFIG_DIR rather than the outputs folder, which belongs to
+# the user's transcripts and recordings.
+JOBS_DIR = CONFIG_DIR / "jobs"
+LOGS_DIR = CONFIG_DIR / "logs"
+_PERSISTED_FIELDS = (
+    "id", "filename", "output_path", "language", "vad", "beam_size", "model",
+    "status", "created_at", "error", "live", "listen_url", "chunk_seconds",
+    "record_path", "record_kind",
+)
+# Segments arrive continuously; between state changes, save at most this often.
+_SAVE_INTERVAL_SECONDS = 5.0
+_INTERRUPTED_ERROR = "後端重新啟動時任務仍在進行，已中斷（已轉出的段落保留在逐字稿檔中）"
+
+
+def _job_record_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def worker_log_path(job_id: str) -> Path:
+    return LOGS_DIR / f"{job_id}.log"
+
+
+def _save_job(job: Job) -> None:
+    """Mirror a job to disk. Best effort: history must never fail a job."""
+    data = {name: getattr(job, name) for name in _PERSISTED_FIELDS}
+    data["events"] = job.events
+    path = _job_record_path(job.id)
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)  # atomic: a crash mid-write keeps the old copy
+    except (OSError, TypeError, ValueError):
+        pass
+    job.saved_at = time.monotonic()
+
+
+def _forget_job(job_id: str) -> None:
+    for path in (_job_record_path(job_id), worker_log_path(job_id)):
+        with suppress(OSError):
+            path.unlink()
+
+
+def _load_saved_jobs() -> None:
+    """Restore the job history written by previous backends.
+
+    A job that was still active when its backend died cannot be resumed —
+    its worker is gone — so it comes back as an error. Its closing state is
+    stamped with the last event's time, not now, so the UI's elapsed-time
+    clocks don't count the downtime.
+    """
+    if not JOBS_DIR.is_dir():
+        return
+    for path in JOBS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            job = Job(file_path="", **{k: data[k] for k in _PERSISTED_FIELDS if k in data})
+        except (OSError, ValueError, TypeError):
+            continue
+        for event in data.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            job.events.append(event)
+            t = event.get("type")
+            if t == "segment":
+                job.segments.append(event)
+            elif t == "estimate":
+                job.estimate = event
+            elif t == "info":
+                job.info = event
+            elif t == "ffmpeg_log":
+                job.ffmpeg_log_count += 1
+        if job.status not in _TERMINAL_STATUSES:
+            stamps = [e["ts"] for e in job.events if isinstance(e.get("ts"), (int, float))]
+            job.status = "error"
+            job.error = _INTERRUPTED_ERROR
+            job.events.append({"type": "state", "status": "error", "error": job.error,
+                               "ts": max(stamps, default=job.created_at)})
+            _save_job(job)
+        JOBS[job.id] = job
+
 
 def _emit(job: Job, event: dict) -> None:
     # Wall-clock stamp so a client joining (or re-joining) mid-job can rebuild
     # elapsed recording / processing time from the replayed history.
     event.setdefault("ts", time.time())
     t = event.get("type")
-    if t not in _TRANSIENT_EVENT_TYPES:
+    keep = t not in _TRANSIENT_EVENT_TYPES
+    if t == "ffmpeg_log":
+        job.ffmpeg_log_count += 1
+        if job.ffmpeg_log_count == MAX_FFMPEG_LOG_EVENTS + 1:
+            job.events.append({"type": "ffmpeg_log", "ts": event["ts"],
+                               "line": "（ffmpeg 輸出過多，之後的訊息不再保留於歷史紀錄）"})
+        keep = job.ffmpeg_log_count <= MAX_FFMPEG_LOG_EVENTS
+    if keep:
         job.events.append(event)
     if t == "segment":
         job.segments.append(event)
@@ -478,6 +583,8 @@ def _emit(job: Job, event: dict) -> None:
         job.estimate = event
     elif t == "info":
         job.info = event
+    if t == "state" or (keep and time.monotonic() - job.saved_at >= _SAVE_INTERVAL_SECONDS):
+        _save_job(job)
     for q in list(job.subscribers):
         try:
             q.put_nowait(event)
@@ -489,96 +596,137 @@ def _emit_state(job: Job) -> None:
     _emit(job, {"type": "state", "status": job.status, "error": job.error})
 
 
-async def _run_job(job: Job) -> None:
-    # probe_duration spawns ffprobe synchronously — push it off-loop so it
-    # never starves a parallel live job's SSE pump.
-    duration = await asyncio.to_thread(probe_duration, job.file_path)
-    if duration is not None:
-        _emit(job, {
-            "type": "estimate",
-            "duration_seconds": duration,
-            "eta_seconds": estimate_eta(duration, job.model, DEVICE, COMPUTE_TYPE),
-            "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
-        })
+# Fire-and-forget tasks must stay referenced: the event loop only keeps a
+# weak reference, so an unreferenced job task can be garbage-collected
+# mid-run and leave its job stuck in "running" forever.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
-    python_bin = str(PYTHON_BIN) if PYTHON_BIN.exists() else sys.executable
-    proc = subprocess.Popen(
-        [python_bin, str(WORKER_PATH)],
-        cwd=str(BACKEND_DIR),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        bufsize=1,
-        text=True,
-    )
-    job.process = proc
-    config = {
-        "file_path": job.file_path,
-        "language": job.language,
-        "vad": job.vad,
-        "beam_size": job.beam_size,
-        "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
-    }
-    proc.stdin.write(json.dumps(config) + "\n")
-    proc.stdin.flush()
-    proc.stdin.close()
 
-    job.status = "running"
-    _emit_state(job)
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
-    out_fh = open(job.output_path, "w", encoding="utf-8")
+
+async def _run_worker(job: Job, script: Path, config: dict) -> None:
+    """Spawn a worker subprocess, feed it `config`, relay its events until it exits.
+
+    Reads until EOF rather than stopping at the first `done`/`error` event: a
+    live worker reports a failed chunk as a warning and keeps going, and a
+    reader that stopped early would leave it blocked on a full stdout pipe.
+    Any failure on our side (spawn, output file) still ends the job in a
+    terminal state — otherwise it would stay "running" and block deletion.
+    """
     loop = asyncio.get_running_loop()
-
+    proc: Optional[subprocess.Popen] = None
     try:
-        while True:
-            line = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.stdout.readline)
-            if not line:
-                break
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "segment":
-                out_fh.write(event["text"] + "\n")
-                out_fh.flush()
-            _emit(job, event)
-            if event.get("type") == "error":
-                job.error = event.get("message")
-            if event.get("type") in ("done", "error"):
-                break
+        python_bin = str(PYTHON_BIN) if PYTHON_BIN.exists() else sys.executable
+        log_fh = _open_worker_log(job.id)
+        try:
+            proc = subprocess.Popen(
+                [python_bin, str(script)],
+                cwd=str(BACKEND_DIR),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # A file, not a pipe: nobody has to drain it, and a traceback
+                # survives for the error message below.
+                stderr=log_fh or subprocess.DEVNULL,
+                start_new_session=True,
+                bufsize=1,
+                text=True,
+            )
+        finally:
+            if log_fh:
+                log_fh.close()  # the child holds its own copy
+        job.process = proc
+        proc.stdin.write(json.dumps(config) + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+
+        job.status = "running"
+        _emit_state(job)
+
+        with open(job.output_path, "w", encoding="utf-8") as out_fh:
+            while True:
+                line = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.stdout.readline)
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "segment":
+                    out_fh.write(event["text"] + "\n")
+                    out_fh.flush()
+                elif event.get("type") == "error":
+                    job.error = event.get("message")
+                _emit(job, event)
+    except Exception as exc:
+        if not job.error:
+            job.error = f"{type(exc).__name__}: {exc}"
+        if proc is not None and proc.poll() is None:
+            _signal_worker(job, signal.SIGKILL)
     finally:
-        out_fh.close()
-        # `proc.wait()` is synchronous — running it on the event loop briefly
-        # freezes every other job's SSE pump while we wait for the worker to
-        # actually exit. Offload it.
-        rc = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.wait)
+        # `proc.wait()` is synchronous — running it on the event loop would
+        # freeze every other job's SSE pump while the worker exits.
+        rc = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.wait) if proc else None
         # Cancellation already set status to "cancelled" — don't overwrite.
         if job.status not in ("cancelled", "error"):
             job.status = "done" if rc == 0 else "error"
             if rc != 0 and not job.error:
-                job.error = f"worker exited with code {rc}"
+                tail = _worker_log_tail(job.id)
+                job.error = f"worker exited with code {rc}" + (f"\n{tail}" if tail else "")
         _emit_state(job)
-        try:
+        # Keep the log only when it says something.
+        with suppress(OSError):
+            log = worker_log_path(job.id)
+            if log.stat().st_size == 0:
+                log.unlink()
+
+
+def _open_worker_log(job_id: str):
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        return open(worker_log_path(job_id), "wb")
+    except OSError:
+        return None
+
+
+def _worker_log_tail(job_id: str, lines: int = 8) -> str:
+    """Last lines of a worker's stderr — for a traceback, the exception itself."""
+    try:
+        text = worker_log_path(job_id).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join([line for line in text.splitlines() if line.strip()][-lines:])
+
+
+async def _run_job(job: Job) -> None:
+    try:
+        # probe_duration spawns ffprobe synchronously — push it off-loop so it
+        # never starves a parallel live job's SSE pump.
+        duration = await asyncio.to_thread(probe_duration, job.file_path)
+        if duration is not None:
+            _emit(job, {
+                "type": "estimate",
+                "duration_seconds": duration,
+                "eta_seconds": estimate_eta(duration, job.model, DEVICE, COMPUTE_TYPE),
+                "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
+            })
+        await _run_worker(job, WORKER_PATH, {
+            "file_path": job.file_path,
+            "language": job.language,
+            "vad": job.vad,
+            "beam_size": job.beam_size,
+            "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
+        })
+    finally:
+        with suppress(OSError):
             os.unlink(job.file_path)
-        except OSError:
-            pass
 
 
 async def _run_live_job(job: Job) -> None:
-    python_bin = str(PYTHON_BIN) if PYTHON_BIN.exists() else sys.executable
-    proc = subprocess.Popen(
-        [python_bin, str(LIVE_WORKER_PATH)],
-        cwd=str(BACKEND_DIR),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        bufsize=1,
-        text=True,
-    )
-    job.process = proc
-    config = {
+    await _run_worker(job, LIVE_WORKER_PATH, {
         "listen_url": job.listen_url,
         "language": job.language,
         "vad": job.vad,
@@ -587,44 +735,7 @@ async def _run_live_job(job: Job) -> None:
         "record_path": job.record_path,
         "record_kind": job.record_kind,
         "model": job.model, "device": DEVICE, "compute": COMPUTE_TYPE,
-    }
-    proc.stdin.write(json.dumps(config) + "\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-
-    job.status = "running"
-    _emit_state(job)
-
-    out_fh = open(job.output_path, "w", encoding="utf-8")
-    loop = asyncio.get_running_loop()
-
-    try:
-        while True:
-            line = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.stdout.readline)
-            if not line:
-                break
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "segment":
-                out_fh.write(event["text"] + "\n")
-                out_fh.flush()
-            _emit(job, event)
-            if event.get("type") == "error":
-                job.error = event.get("message")
-            if event.get("type") in ("done", "error"):
-                break
-    finally:
-        out_fh.close()
-        # See note above: never block the event loop on a sync wait — would
-        # starve a parallel file-conversion job's stdout reader.
-        rc = await loop.run_in_executor(_WORKER_IO_EXECUTOR, proc.wait)
-        if job.status not in ("cancelled", "error"):
-            job.status = "done" if rc == 0 else "error"
-            if rc != 0 and not job.error:
-                job.error = f"worker exited with code {rc}"
-        _emit_state(job)
+    })
 
 
 @app.get("/api/health")
@@ -683,7 +794,7 @@ def _model_entry(name: str, meta: dict) -> dict:
 
 def _models_in_use() -> set[str]:
     """Models belonging to jobs that could still load weights off disk."""
-    return {j.model for j in JOBS.values() if j.status in ("queued", "running", "paused")}
+    return {j.model for j in list(JOBS.values()) if j.status in ("queued", "running", "paused")}
 
 
 @app.post("/api/models/{model}/download")
@@ -846,6 +957,7 @@ async def create_job(
         raise HTTPException(400, "missing filename")
 
     model_name = resolve_model(model)
+    _check_beam_size(beam_size)
 
     try:
         base_dir = resolve_job_base_dir(output_dir)
@@ -858,11 +970,16 @@ async def create_job(
         # Copy off the event loop so large uploads don't freeze in-flight SSE
         # streams (e.g. a live OBS job already running in parallel).
         await asyncio.to_thread(_copy_upload_sync, file.file, tmp)
+        job_dir = reserve_job_dir(base_dir)
+    except BaseException:
+        # No job will ever own this upload, so nothing else would delete it.
+        with suppress(OSError):
+            os.unlink(tmp.name)
+        raise
     finally:
         await file.close()
 
     job_id = uuid.uuid4().hex[:12]
-    job_dir = reserve_job_dir(base_dir)
     job = Job(
         id=job_id,
         filename=file.filename,
@@ -874,8 +991,14 @@ async def create_job(
         model=model_name,
     )
     JOBS[job_id] = job
-    asyncio.create_task(_run_job(job))
+    _save_job(job)
+    _spawn(_run_job(job))
     return {"id": job_id, "model": model_name}
+
+
+def _check_beam_size(beam_size: int) -> None:
+    if beam_size < 1:
+        raise HTTPException(400, "beam_size must be at least 1")
 
 
 def _normalize_listen_url(url: str) -> str:
@@ -893,6 +1016,7 @@ def _normalize_listen_url(url: str) -> str:
 
 
 _LIVE_ACTIVE_STATUSES = {"queued", "running", "paused"}
+_TERMINAL_STATUSES = {"done", "error", "cancelled"}
 
 
 def _listen_endpoint(url: str) -> Optional[tuple[str, int]]:
@@ -922,7 +1046,7 @@ def _conflicting_live_job(listen_url: str) -> Optional[Job]:
     endpoint = _listen_endpoint(listen_url)
     if endpoint is None:
         return None
-    for job in JOBS.values():
+    for job in list(JOBS.values()):
         if not job.live or job.status not in _LIVE_ACTIVE_STATUSES:
             continue
         other = _listen_endpoint(job.listen_url or "")
@@ -993,6 +1117,12 @@ async def create_live_job(
 ) -> dict:
     listen_url = _normalize_listen_url(listen_url)
     model_name = resolve_model(model, LIVE_MODEL_SIZE)
+    _check_beam_size(beam_size)
+    # The worker slices the stream into chunk_seconds of PCM; zero or negative
+    # would make that slicing loop spin forever on empty chunks.
+    if not MIN_CHUNK_SECONDS <= chunk_seconds <= MAX_CHUNK_SECONDS:
+        raise HTTPException(
+            400, f"chunk_seconds must be between {MIN_CHUNK_SECONDS:g} and {MAX_CHUNK_SECONDS:g}")
     try:
         base_dir = resolve_job_base_dir(output_dir)
     except OSError as exc:
@@ -1042,7 +1172,8 @@ async def create_live_job(
         record_kind=kind if record else None,
     )
     JOBS[job_id] = job
-    asyncio.create_task(_run_live_job(job))
+    _save_job(job)
+    _spawn(_run_live_job(job))
     return {
         "id": job_id, "listen_url": listen_url, "chunk_seconds": chunk_seconds,
         "record_path": record_path, "record_kind": job.record_kind,
@@ -1052,7 +1183,7 @@ async def create_live_job(
 
 @app.get("/api/jobs")
 def list_jobs() -> dict:
-    items = [j.summary() for j in sorted(JOBS.values(), key=lambda j: -j.created_at)]
+    items = [j.summary() for j in sorted(list(JOBS.values()), key=lambda j: -j.created_at)]
     return {"jobs": items}
 
 
@@ -1070,18 +1201,23 @@ async def job_events(job_id: str) -> StreamingResponse:
     if not job:
         raise HTTPException(404, "job not found")
 
-    queue: asyncio.Queue = asyncio.Queue()
-    job.subscribers.append(queue)
-
     async def stream() -> AsyncIterator[bytes]:
+        # Snapshot the history and subscribe in one step, with no await in
+        # between: an event emitted in a gap would land in both the replay
+        # and the queue, and the client would show that segment twice.
+        queue: asyncio.Queue = asyncio.Queue()
+        history = list(job.events)
+        job.subscribers.append(queue)
         try:
-            for event in list(job.events):
+            for event in history:
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
             yield f"data: {json.dumps({'type': 'state', 'status': job.status, 'error': job.error})}\n\n".encode("utf-8")
+            if job.status in _TERMINAL_STATUSES:
+                return  # nothing more will ever arrive; don't hold the connection open
             while True:
                 event = await queue.get()
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
-                if event.get("type") == "state" and event.get("status") in ("done", "error", "cancelled"):
+                if event.get("type") == "state" and event.get("status") in _TERMINAL_STATUSES:
                     break
         finally:
             try:
@@ -1102,9 +1238,19 @@ def _signal_worker(job: Job, sig: int) -> None:
             pass
 
 
+# The job-control endpoints below are `async def` on purpose: they call
+# `_emit`, which feeds asyncio.Queues that are only safe to touch from the
+# event loop thread. As sync endpoints they ran in a threadpool, and an SSE
+# client could miss the wake-up (e.g. never see its "paused" state).
+
+
 @app.post("/api/jobs/{job_id}/pause")
-def pause_job(job_id: str) -> dict:
+async def pause_job(job_id: str) -> dict:
     job = JOBS.get(job_id) or _404()
+    if job.live:
+        # SIGSTOP would freeze ffmpeg too, which stops draining the socket —
+        # the sender then drops the connection (see live_worker.py, note 1).
+        raise HTTPException(409, "live jobs cannot be paused; stop the stream instead")
     if job.status == "running":
         _signal_worker(job, signal.SIGSTOP)
         job.status = "paused"
@@ -1113,7 +1259,7 @@ def pause_job(job_id: str) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/resume")
-def resume_job(job_id: str) -> dict:
+async def resume_job(job_id: str) -> dict:
     job = JOBS.get(job_id) or _404()
     if job.status == "paused":
         _signal_worker(job, signal.SIGCONT)
@@ -1123,7 +1269,7 @@ def resume_job(job_id: str) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict:
+async def cancel_job(job_id: str) -> dict:
     job = JOBS.get(job_id) or _404()
     if job.status in ("running", "paused"):
         if job.status == "paused":
@@ -1140,23 +1286,24 @@ def cancel_job(job_id: str) -> dict:
         # with "Address already in use" and the new job appears to crash.
         proc = job.process
         if proc is not None:
+            loop = asyncio.get_running_loop()
             try:
-                proc.wait(timeout=5)
+                await loop.run_in_executor(_WORKER_IO_EXECUTOR, lambda: proc.wait(timeout=5))
             except subprocess.TimeoutExpired:
                 _signal_worker(job, signal.SIGKILL)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+                with suppress(subprocess.TimeoutExpired):
+                    await loop.run_in_executor(_WORKER_IO_EXECUTOR, lambda: proc.wait(timeout=2))
     return {"ok": True, "status": job.status}
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str) -> dict:
+async def delete_job(job_id: str) -> dict:
     job = JOBS.get(job_id) or _404()
     if job.status in ("running", "paused", "queued"):
         raise HTTPException(409, "job is still active; cancel it first")
     JOBS.pop(job_id, None)
+    # Only the history entry and log go; transcripts and recordings stay.
+    _forget_job(job_id)
     return {"ok": True}
 
 
@@ -1180,3 +1327,7 @@ def download_recording(job_id: str) -> FileResponse:
 
 def _404():
     raise HTTPException(404, "job not found")
+
+
+# Last, once everything it references (Job, _TERMINAL_STATUSES…) exists.
+_load_saved_jobs()

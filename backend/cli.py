@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import select
 import shutil
 import signal
@@ -196,7 +197,7 @@ def web_ok(port: int) -> bool:
     return False
 
 
-def spawn_frontend(port: int, console: Console) -> Optional[subprocess.Popen]:
+def spawn_frontend(port: int, backend_port: int, console: Console) -> Optional[subprocess.Popen]:
     if not FRONTEND_DIR.exists():
         console.print(f"[yellow]frontend dir not found: {FRONTEND_DIR}[/yellow]")
         return None
@@ -205,6 +206,9 @@ def spawn_frontend(port: int, console: Console) -> Optional[subprocess.Popen]:
         return None
     env = os.environ.copy()
     env["PORT"] = str(port)
+    # vite.config.ts proxies /api to MEET_BACKEND_PORT (default 7001). Without
+    # this, an isolated CLI's frontend would talk to some other backend.
+    env["MEET_BACKEND_PORT"] = str(backend_port)
     console.print(f"[dim]starting frontend on :{port} …[/dim]")
     vite_bin = FRONTEND_DIR / "node_modules" / ".bin" / "vite"
     cmd = [str(vite_bin), "--port", str(port)] if vite_bin.exists() else ["npm", "run", "dev", "--", "--port", str(port)]
@@ -305,7 +309,7 @@ def fmt_duration(s: float) -> str:
 
 
 def fmt_ts(s: float) -> str:
-    m, sec = divmod(s, 60)
+    m, sec = divmod(round(s, 1), 60)
     return f"{int(m):02d}:{sec:04.1f}"
 
 
@@ -399,7 +403,7 @@ def _ensure_servers(args, host: str, port: int, console: Console, children: list
     elif outputs_dir is not None:
         console.print(f"[yellow]backend already running on :{port} — --outputs-dir is ignored[/yellow]")
     if args.web:
-        web_proc = spawn_frontend(args.web_port, console)
+        web_proc = spawn_frontend(args.web_port, port, console)
         if web_proc is not None:
             children.append(web_proc)
             wait_frontend_ready(web_proc, args.web_port, console)
@@ -637,6 +641,7 @@ def run_human(args, host: str, port: int) -> int:
 
     rc = _ensure_servers(args, host, port, console, children)
     if rc is not None:
+        cleanup_servers()  # a backend that never got healthy may still be running
         return rc
 
     if args.web:
@@ -661,7 +666,7 @@ def run_human(args, host: str, port: int) -> int:
         try:
             resp = create_live_job(
                 host, port, args.listen_url,
-                None if args.language == "auto" else args.language,
+                args.language,
                 not args.no_vad, args.beam_size, args.chunk_seconds, args.label,
                 args.model,
             )
@@ -681,7 +686,7 @@ def run_human(args, host: str, port: int) -> int:
             return 2
 
         try:
-            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language,
+            job_id = create_job(host, port, file_path, args.language,
                                 not args.no_vad, args.beam_size, args.model)
         except httpx.HTTPError as e:
             console.print(f"[red]failed to create job: {e}[/red]")
@@ -722,7 +727,11 @@ def run_human(args, host: str, port: int) -> int:
         if not segments:
             body.append("waiting for segments…\n", style="dim")
 
-        hint = Text("\n[p] pause/resume   [c] cancel   [q] quit (cancels job)", style="dim")
+        hint = Text(
+            "\n[c] stop   [q] quit (stops job)" if args.live
+            else "\n[p] pause/resume   [c] cancel   [q] quit (cancels job)",
+            style="dim",
+        )
         title = f"Meet · {state['status']}"
         return Group(
             Panel(head, title=title, border_style="cyan"),
@@ -731,46 +740,74 @@ def run_human(args, host: str, port: int) -> int:
             hint,
         )
 
+    # Events arrive on their own thread: reading the stream inline would only
+    # look at key presses when an event happens to arrive, so [c]/[q] did
+    # nothing while a model loaded or a live job waited for OBS.
+    events: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
+    def pump_events() -> None:
+        try:
+            for ev in stream_job_events(host, port, job_id):
+                events.put(("event", ev))
+        except httpx.HTTPError as exc:
+            events.put(("http_error", exc))
+        finally:
+            events.put(("end", None))
+
+    threading.Thread(target=pump_events, name="meet-events", daemon=True).start()
+
     keys.start()
     exit_code = 0
     out_fh = open(args.output, "w", encoding="utf-8") if args.output else None
     quit_requested = False
+    finished = False
     try:
         with Live(render(), console=console, refresh_per_second=8) as live:
-            for event in stream_job_events(host, port, job_id):
-                t = event.get("type")
-                if t == "estimate":
-                    estimate = event
-                    progress.update(task_id, eta=fmt_duration(event["eta_seconds"]))
-                elif t == "info":
-                    info = event
-                elif t == "segment":
-                    segments.append(event)
-                    if out_fh:
-                        out_fh.write(event["text"] + "\n"); out_fh.flush()
-                    if estimate and estimate["duration_seconds"] > 0:
-                        pct = min(100, event["end"] / estimate["duration_seconds"] * 100)
-                        remaining = max(0, estimate["eta_seconds"] * (1 - pct / 100))
-                        progress.update(task_id, completed=pct, eta=fmt_duration(remaining))
-                elif t == "state":
-                    state["status"] = event.get("status", state["status"])
-                    if event.get("status") == "done":
-                        progress.update(task_id, completed=100, eta="0s")
-                    if event.get("status") in ("done", "error", "cancelled"):
-                        if event.get("status") == "error":
-                            exit_code = 1
-                        live.update(render())
-                        break
-                elif t == "error":
-                    state["status"] = "error"
+            while not finished and not quit_requested:
+                try:
+                    kind, payload = events.get(timeout=0.2)
+                except queue.Empty:
+                    kind, payload = "idle", None
+                if kind == "end":
+                    break
+                if kind == "http_error":
+                    console.print(f"[red]http error: {payload}[/red]")
                     exit_code = 1
+                    break
+                if kind == "event":
+                    event = payload
+                    t = event.get("type")
+                    if t == "estimate":
+                        estimate = event
+                        progress.update(task_id, eta=fmt_duration(event["eta_seconds"]))
+                    elif t == "info":
+                        info = event
+                    elif t == "segment":
+                        segments.append(event)
+                        if out_fh:
+                            out_fh.write(event["text"] + "\n"); out_fh.flush()
+                        if estimate and estimate["duration_seconds"] > 0:
+                            pct = min(100, event["end"] / estimate["duration_seconds"] * 100)
+                            remaining = max(0, estimate["eta_seconds"] * (1 - pct / 100))
+                            progress.update(task_id, completed=pct, eta=fmt_duration(remaining))
+                    elif t == "state":
+                        state["status"] = event.get("status", state["status"])
+                        if event.get("status") == "done":
+                            progress.update(task_id, completed=100, eta="0s")
+                        if event.get("status") in ("done", "error", "cancelled"):
+                            if event.get("status") == "error":
+                                exit_code = 1
+                            finished = True
+                    elif t == "error":
+                        state["status"] = "error"
+                        exit_code = 1
 
                 # Drain key presses
                 while True:
                     ch = keys.pop()
                     if ch is None:
                         break
-                    if ch == "p":
+                    if ch == "p" and not args.live:  # live jobs can't be paused
                         action = "resume" if state["status"] == "paused" else "pause"
                         post_job_action(host, port, job_id, action)
                     elif ch == "c":
@@ -780,11 +817,6 @@ def run_human(args, host: str, port: int) -> int:
                         post_job_action(host, port, job_id, "cancel")
 
                 live.update(render())
-                if quit_requested:
-                    break
-    except httpx.HTTPError as e:
-        console.print(f"[red]http error: {e}[/red]")
-        exit_code = 1
     finally:
         keys.stop()
         if out_fh:
@@ -827,6 +859,8 @@ def run_json(args, host: str, port: int) -> int:
     if rc is not None:
         if rc == 2:
             print(json.dumps({"type": "error", "message": "backend autostart failed"}))
+        for p in reversed(children):
+            kill_group(p)
         return rc
     if args.web:
         web_url = f"http://localhost:{args.web_port}"
@@ -841,7 +875,7 @@ def run_json(args, host: str, port: int) -> int:
         try:
             resp = create_live_job(
                 host, port, args.listen_url,
-                None if args.language == "auto" else args.language,
+                args.language,
                 not args.no_vad, args.beam_size, args.chunk_seconds, args.label,
                 args.model,
             )
@@ -862,7 +896,7 @@ def run_json(args, host: str, port: int) -> int:
             return 2
 
         try:
-            job_id = create_job(host, port, file_path, None if args.language == "auto" else args.language,
+            job_id = create_job(host, port, file_path, args.language,
                                 not args.no_vad, args.beam_size, args.model)
         except httpx.HTTPError as e:
             print(json.dumps({"type": "error", "message": str(e)}))

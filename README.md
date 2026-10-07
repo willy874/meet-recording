@@ -452,6 +452,9 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 { "type": "disconnected", "attempt": 0, "grace_seconds": 60.0, "rc": 0 }
 { "type": "reconnected", "attempt": 1, "record_path": "outputs/…/recording.2.mkv" }
 
+// 直播模式才有：某一段轉錄失敗，任務繼續（不是終止）
+{ "type": "warning", "message": "transcribe error: …" }
+
 // 任務狀態變化
 { "type": "state", "status": "running|paused|done|error|cancelled", "error": null }
 
@@ -460,15 +463,15 @@ ffmpeg -i tcp://0.0.0.0:9999?listen=1 \
 { "type": "error", "message": "..." }
 ```
 
-訂閱前已產生的事件會 **完整 replay**，可中途連入不漏資訊。
+訂閱前已產生的事件會 **完整 replay**，可中途連入不漏資訊。任務已結束時，replay 完就關閉連線。
 
 ### 控制
 
 | 端點 | 動作 |
 |------|------|
-| `POST /api/jobs/{id}/pause` | SIGSTOP worker process group（直播模式不建議用） |
+| `POST /api/jobs/{id}/pause` | SIGSTOP worker process group（直播任務回 409：凍結 ffmpeg 會讓 OBS 斷線） |
 | `POST /api/jobs/{id}/resume` | SIGCONT |
-| `POST /api/jobs/{id}/cancel` | SIGTERM、status → `cancelled` |
+| `POST /api/jobs/{id}/cancel` | SIGINT、status → `cancelled`（直播的 ffmpeg 會先寫完錄影檔尾） |
 | `GET /api/jobs/{id}/output` | 下載 `.txt` |
 | `GET /api/jobs/{id}/recording` | 下載直播時的影片檔（須有勾 `record`） |
 
@@ -526,3 +529,8 @@ meet/
 - 後端 `CORSMiddleware` 預設 `*`，部署到公開環境請收斂來源。
 - 上傳檔暫存在系統 `tempfile`，請求結束自動刪。直播任務不產生上傳暫存。
 - 暫停／取消用 process group signals（killpg），所以連 ffmpeg 子程序也會跟著被收。
+- 後端被關掉（Ctrl-C、`--reload`、當掉）時，worker 會偵測到父程序消失並自行結束；直播的 ffmpeg 會先寫完錄影檔尾，監聽埠也會釋放。
+- 任務清單保存在 `~/.meet/jobs/{id}.json`（跟著 `MEET_CONFIG_DIR`），後端重啟後仍看得到；重啟當下還在跑的任務會標成 `error`（已中斷），已轉出的段落都在。從側欄移除任務只刪這筆紀錄，逐字稿與錄影檔不動。
+- worker 的 stderr 寫到 `~/.meet/logs/{id}.log`（空的會自動刪）；worker 異常結束時，錯誤訊息會附上 log 最後幾行。
+- 直播任務的 `ffmpeg_log` 事件只保留前 200 筆在歷史紀錄裡，之後仍即時推送但不再重播，避免串流異常時記憶體無限成長。
+- `backend/run.sh` 預設只綁 `127.0.0.1`（API 沒有驗證且能開資料夾）；要讓區網連入請設 `HOST=0.0.0.0`。

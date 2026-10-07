@@ -9,7 +9,8 @@ Event schema is identical to ``worker.py`` plus live-only events:
 ``listening`` (model loaded, ffmpeg spawned), ``receiving`` (first PCM
 bytes arrived), ``backlog`` (transcription is falling behind / caught up
 again), ``disconnected`` (the sender went away, waiting for it to come
-back) and ``reconnected`` (a new sender connected).
+back), ``reconnected`` (a new sender connected) and ``warning`` (one chunk
+failed to transcribe; the session carries on).
 
 Two things this worker must never do, both learned the hard way:
 
@@ -27,9 +28,10 @@ Two things this worker must never do, both learned the hard way:
    job and stop listening, leaving OBS's auto-reconnect with nothing to
    connect to. Instead we respawn ffmpeg and wait out a grace period.
 
-Lifecycle is controlled by the parent via signals: SIGSTOP/SIGCONT pause
-and resume the entire process group (including ffmpeg) and SIGTERM
-terminates it. Started with ``start_new_session=True`` by the parent so
+Lifecycle is controlled by the parent via signals: SIGINT (or SIGTERM)
+stops the session. There is no pause — SIGSTOP would freeze ffmpeg too,
+which is exactly the backpressure note 1 warns about, so the backend
+refuses to pause live jobs. Started with ``start_new_session=True`` by the parent so
 ``killpg`` reaches both this script and its ffmpeg child.
 """
 from __future__ import annotations
@@ -47,6 +49,8 @@ from typing import Optional
 import numpy as np
 from faster_whisper import WhisperModel
 
+from parent_watch import watch_parent
+
 
 _LANG_PROMPTS = {
     "zh-TW": ("zh", "以下是繁體中文的句子。"),
@@ -55,6 +59,7 @@ _LANG_PROMPTS = {
 
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # s16le mono
+BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE
 
 # How long to keep the port open after the sender disconnects before giving
 # up on the session. OBS' auto-reconnect retries every few seconds, so a
@@ -389,14 +394,16 @@ def main():
     record_path = config.get("record_path")  # optional path to mux a copy of the stream
     record_kind = config.get("record_kind", "video")  # "video" (stream-copy all) | "audio" (audio only)
     grace = float(config.get("reconnect_grace_seconds", RECONNECT_GRACE_SECONDS))
-    chunk_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * chunk_seconds)
-    max_backlog_bytes = int(SAMPLE_RATE * BYTES_PER_SAMPLE * MAX_BACKLOG_SECONDS)
+    # Whole samples only: an odd byte count would split an int16 in two.
+    chunk_bytes = max(BYTES_PER_SAMPLE, int(BYTES_PER_SECOND * chunk_seconds) // BYTES_PER_SAMPLE * BYTES_PER_SAMPLE)
+    max_backlog_bytes = int(BYTES_PER_SECOND * MAX_BACKLOG_SECONDS)
 
     signal.signal(signal.SIGTERM, _on_term)
     # main.py cancels live jobs by sending SIGINT to the worker group so
     # ffmpeg receives it directly and writes a clean trailer (moov atom for
     # MP4/m4a). Handle it here as well so the worker shuts down promptly.
     signal.signal(signal.SIGINT, _on_term)
+    watch_parent(signal.SIGINT)
 
     try:
         model = WhisperModel(model_size, device=device, compute_type=compute)
@@ -406,13 +413,17 @@ def main():
 
     whisper_lang, initial_prompt = resolve_language(language)
     info_emitted = False
-    chunk_index = 0
+    # Stream time (seconds) of the first byte in `buf`. Advanced by exactly
+    # the audio each chunk covers — and by any audio dropped from the
+    # backlog — so segment timestamps stay on the stream's own clock.
+    timeline = 0.0
     buf = bytearray()
     lagging = False
     meter = LevelMeter()
 
     def transcribe_chunk(pcm: bytes, t0: float) -> None:
         nonlocal info_emitted
+        pcm = pcm[: len(pcm) - len(pcm) % BYTES_PER_SAMPLE]
         if not pcm:
             return
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
@@ -445,12 +456,14 @@ def main():
                     "text": text,
                 })
         except Exception as exc:
-            emit({"type": "error", "message": f"transcribe error: {exc}"})
+            # One bad chunk shouldn't end the session: it's a warning, not an
+            # `error` (which the backend treats as the job failing).
+            emit({"type": "warning", "message": f"transcribe error: {exc}"})
 
     def report_backlog() -> None:
         """Tell the parent how far behind whisper is, on change."""
         nonlocal lagging
-        seconds = len(buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+        seconds = len(buf) / BYTES_PER_SECOND
         if seconds >= chunk_seconds:
             lagging = True
             emit({"type": "backlog", "seconds": round(seconds, 1), "lagging": True})
@@ -517,19 +530,22 @@ def main():
                         emit(silence)
                     if len(buf) > max_backlog_bytes:
                         dropped = len(buf) - max_backlog_bytes
+                        # Drop whole samples, or every later chunk would be
+                        # decoded off by one byte — pure noise.
+                        dropped += dropped % BYTES_PER_SAMPLE
                         del buf[:dropped]
+                        timeline += dropped / BYTES_PER_SECOND
                         emit({
                             "type": "backlog",
-                            "seconds": round(len(buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE), 1),
+                            "seconds": round(len(buf) / BYTES_PER_SECOND, 1),
                             "lagging": True,
-                            "dropped_seconds": round(dropped / (SAMPLE_RATE * BYTES_PER_SAMPLE), 1),
+                            "dropped_seconds": round(dropped / BYTES_PER_SECOND, 1),
                         })
                     while len(buf) >= chunk_bytes:
-                        t0 = chunk_index * chunk_seconds
                         pcm = bytes(buf[:chunk_bytes])
                         del buf[:chunk_bytes]
-                        chunk_index += 1
-                        transcribe_chunk(pcm, t0)
+                        transcribe_chunk(pcm, timeline)
+                        timeline += chunk_bytes / BYTES_PER_SECOND
                         report_backlog()
                     continue
                 if eof:
@@ -540,9 +556,9 @@ def main():
             # Audio is not continuous across a reconnect, so flush whatever
             # is left (if it's worth transcribing) and start the next
             # connection with an empty buffer.
-            if len(buf) >= SAMPLE_RATE * BYTES_PER_SAMPLE:
-                transcribe_chunk(bytes(buf), chunk_index * chunk_seconds)
-                chunk_index += 1
+            if len(buf) >= BYTES_PER_SECOND:
+                transcribe_chunk(bytes(buf), timeline)
+            timeline += len(buf) / BYTES_PER_SECOND
             buf.clear()
             lagging = False
 

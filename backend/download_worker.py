@@ -20,6 +20,8 @@ import time
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
+from parent_watch import watch_parent
+
 ALLOW_PATTERNS = [
     "config.json",
     "preprocessor_config.json",
@@ -90,6 +92,7 @@ class ReportingTqdm(tqdm):
 
 
 def main() -> None:
+    watch_parent()
     config = json.loads(sys.stdin.readline())
     model = config["model"]
     # Mirrors main.py's model_is_cached(), which looks for exactly this repo.

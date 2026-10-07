@@ -11,7 +11,9 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': {
-        target: `http://localhost:${backendPort}`,
+        // 127.0.0.1, not localhost: the backend binds IPv4 loopback only, and
+        // localhost may resolve to ::1 first.
+        target: `http://127.0.0.1:${backendPort}`,
         changeOrigin: true,
       },
     },

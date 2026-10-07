@@ -45,8 +45,9 @@ type ModelInfo = {
 }
 
 const formatTs = (s: number) => {
-  const m = Math.floor(s / 60)
-  const sec = (s % 60).toFixed(1).padStart(4, '0')
+  const t = Math.round(s * 10) / 10
+  const m = Math.floor(t / 60)
+  const sec = (t - m * 60).toFixed(1).padStart(4, '0')
   return `${m.toString().padStart(2, '0')}:${sec}`
 }
 
@@ -186,6 +187,8 @@ export default function App() {
                   key={selected}
                   jobId={selected}
                   onChange={refreshJobs}
+                  // Deleted from another tab or the CLI, or the backend restarted.
+                  onMissing={() => setSelected((cur) => (cur === selected ? null : cur))}
                   onCancelPendingChange={setCancelPending}
                 />
               : <NewJob
@@ -700,7 +703,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
   onCreated: (id: string, autoSelect?: boolean) => void
   defaultOutputsDir: string | null
 }) {
-  const initial = loadNewJobPrefs()
+  const [initial] = useState(loadNewJobPrefs)
   const [mode, setMode] = useState<'file' | 'live'>(initial.mode)
   const [files, setFiles] = useState<File[]>([])
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
@@ -734,14 +737,17 @@ function NewJob({ onCreated, defaultOutputsDir }: {
       const r = await fetch('/api/models', { signal })
       if (!r.ok) return
       const data = await r.json()
-      setModels(data.models ?? [])
+      const list: ModelInfo[] = data.models ?? []
+      setModels(list)
       const fileDefault = (data.default as string) || ''
       const liveDefault = (data.live_default as string) || fileDefault
       setBackendDefaultModel(fileDefault)
       setBackendLiveDefaultModel(liveDefault)
-      // Only adopt the backend defaults when the user has no stored choice.
-      setFileModel((cur) => cur || fileDefault)
-      setLiveModel((cur) => cur || liveDefault)
+      // Keep the user's stored choice unless the backend no longer offers it
+      // (the job would be rejected as "unknown model").
+      const known = (id: string) => list.some((m) => m.id === id)
+      setFileModel((cur) => (cur && known(cur) ? cur : fileDefault))
+      setLiveModel((cur) => (cur && known(cur) ? cur : liveDefault))
     } catch { /* offline backend — the Select just stays empty */ }
   }
 
@@ -864,8 +870,8 @@ function NewJob({ onCreated, defaultOutputsDir }: {
       if (outputDir.trim()) form.append('output_dir', outputDir.trim())
       try {
         const r = await fetch('/api/jobs', { method: 'POST', body: form })
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const data = await r.json()
+        const data = await r.json().catch(() => ({}))
+        if (!r.ok) throw new Error(typeof data?.detail === 'string' ? data.detail : `HTTP ${r.status}`)
         lastId = data.id
         // refresh sidebar after every job; do NOT auto-select so user stays on the form
         onCreated(data.id, false)
@@ -1379,9 +1385,10 @@ function AudioMeter({ levels }: { levels: RefObject<LevelState> }) {
   return <canvas ref={canvasRef} style={{ width: '100%', height: 64, display: 'block' }} />
 }
 
-function JobDetail({ jobId, onChange, onCancelPendingChange }: {
+function JobDetail({ jobId, onChange, onMissing, onCancelPendingChange }: {
   jobId: string
   onChange: () => void
+  onMissing: () => void
   onCancelPendingChange?: (pending: boolean) => void
 }) {
   const [estimate, setEstimate] = useState<Estimate | null>(null)
@@ -1389,6 +1396,8 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const [segments, setSegments] = useState<Segment[]>([])
   const [status, setStatus] = useState<JobStatus>('queued')
   const [error, setError] = useState<string | null>(null)
+  // Non-fatal problems (e.g. one live chunk failed to transcribe); the job carries on.
+  const [warning, setWarning] = useState<string | null>(null)
   const [filename, setFilename] = useState<string>('')
   const [live, setLive] = useState<boolean>(false)
   const [listenUrl, setListenUrl] = useState<string | null>(null)
@@ -1417,24 +1426,31 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
   const sseAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    setEstimate(null); setInfo(null); setSegments([]); setError(null); setStatus('queued'); setListening(false); setReceiving(false)
+    setEstimate(null); setInfo(null); setSegments([]); setError(null); setWarning(null); setStatus('queued'); setListening(false); setReceiving(false)
     setWaitingReconnect(false); setReconnects(0); setBacklog(0); setAudioSilent(false)
     setRecClock(STOPWATCH_ZERO); setProcClock(STOPWATCH_ZERO)
     levelsRef.current = { peaks: [], rms: [], silentSeconds: 0, version: 0 }
-    fetch(`/api/jobs/${jobId}`).then((r) => r.json()).then((j) => {
+    const ctrl = new AbortController()
+    sseAbortRef.current = ctrl
+    fetch(`/api/jobs/${jobId}`, { signal: ctrl.signal }).then(async (r) => {
+      if (r.status === 404) { onMissing(); return }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const j = await r.json()
       setFilename(j.filename || '')
       setLive(!!j.live)
       setListenUrl(j.listen_url || null)
       setRecordPath(j.record_path || null)
       setRecordKind(j.record_kind || null)
       setOutputPath(j.output_path || null)
+    }).catch((e: Error) => {
+      if (e.name !== 'AbortError') setError(e.message)
     })
-    const ctrl = new AbortController()
-    sseAbortRef.current = ctrl
     ;(async () => {
       try {
         const res = await fetch(`/api/jobs/${jobId}/events`, { signal: ctrl.signal })
-        if (!res.body) return
+        // A 404 body is JSON, not an event stream; the job fetch above
+        // already handles the missing-job case.
+        if (!res.ok || !res.body) return
         const reader = res.body.getReader()
         const decoder = new TextDecoder('utf-8')
         let buf = ''
@@ -1488,6 +1504,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
               onChange()
             }
             else if (ev.type === 'error') setError(ev.message)
+            else if (ev.type === 'warning') setWarning(ev.message)
           }
         }
       } catch (e: unknown) {
@@ -1535,8 +1552,14 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
     // for live jobs.
     if (a === 'cancel' && !live) onCancelPendingChange?.(true)
     try {
-      await fetch(`/api/jobs/${jobId}/${a}`, { method: 'POST' })
+      const r = await fetch(`/api/jobs/${jobId}/${a}`, { method: 'POST' })
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}))
+        throw new Error(typeof data?.detail === 'string' ? data.detail : `HTTP ${r.status}`)
+      }
       onChange()
+    } catch (e) {
+      setError((e as Error).message)
     } finally {
       setPendingAction(null)
       if (a === 'cancel' && !live) onCancelPendingChange?.(false)
@@ -1718,6 +1741,9 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       </Card>
 
       {error && <Alert severity="error">錯誤：{error}</Alert>}
+      {warning && (
+        <Alert severity="warning" onClose={() => setWarning(null)}>注意：{warning}</Alert>
+      )}
 
       {pendingAction === 'cancel' && (
         <Alert severity="warning">

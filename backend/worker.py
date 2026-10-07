@@ -2,15 +2,18 @@
 
 Reads a single JSON config line from stdin, emits NDJSON events on stdout.
 The parent controls lifecycle via signals: SIGSTOP/SIGCONT for pause/resume,
-SIGTERM for cancel. No special handling needed in this script — the OS
+SIGINT for cancel. No special handling needed in this script — the OS
 suspends/resumes/terminates the process directly.
 """
 from __future__ import annotations
 
 import json
+import signal
 import sys
 
 from faster_whisper import WhisperModel
+
+from parent_watch import watch_parent
 
 
 _LANG_PROMPTS = {
@@ -35,6 +38,12 @@ def emit(event):
 
 
 def main():
+    # The backend cancels with SIGINT. Python's own SIGINT handler only runs
+    # between bytecodes, i.e. after the current CTranslate2 call returns —
+    # seconds with a large model, so cancel always hit its 5 s kill timeout.
+    # Nothing here needs cleanup, so let the kernel end us immediately.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    watch_parent()
     config = json.loads(sys.stdin.readline())
     file_path = config["file_path"]
     language = config.get("language")
