@@ -296,7 +296,7 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
                 slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } } }}
                 onKeyDown={(e) => { if (e.key === 'Enter') save() }}
               />
-              <Stack direction="row" spacing={1}>
+              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap', flexShrink: 0 }}>
                 <Tooltip title="開啟本機原生資料夾選擇對話框">
                   <span>
                     <Button size="small" onClick={pickFolder} disabled={saving || picking}>
@@ -338,7 +338,7 @@ function OutputsDirBar({ value, onChange }: { value: string | null; onChange: (v
                   {value || '（載入中…）'}
                 </Typography>
               </Tooltip>
-              <Stack direction="row" spacing={1}>
+              <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap', flexShrink: 0 }}>
                 <Tooltip title="在檔案總管／Finder 開啟">
                   <span>
                     <Button
@@ -941,7 +941,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
 
         {mode === 'file' ? (
           <Box sx={{ mb: 2 }}>
-            <Stack direction="row" spacing={1} sx={{ mb: files.length ? 1 : 0, alignItems: 'center' }}>
+            <Stack direction="row" spacing={1} useFlexGap sx={{ mb: files.length ? 1 : 0, alignItems: 'center', flexWrap: 'wrap' }}>
               <Button variant="outlined" component="label">
                 {files.length === 0
                   ? '選擇音訊／影片檔（可多選）'
@@ -1140,7 +1140,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
             fullWidth
             slotProps={{ input: { sx: { fontFamily: 'ui-monospace, monospace', fontSize: 13 } } }}
           />
-          <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexShrink: 0, flexWrap: 'wrap' }}>
             <Tooltip title={outputDir.trim() ? '在檔案總管／Finder 開啟這個資料夾' : '在檔案總管／Finder 開啟預設輸出資料夾'}>
               <span>
                 <Button
@@ -1148,7 +1148,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
                   startIcon={<FolderOpenIcon />}
                   onClick={openOutputDir}
                   disabled={openingOutputDir || (!outputDir.trim() && !defaultOutputsDir)}
-                  sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}
+                  sx={{ minWidth: 'auto' }}
                 >
                   開啟
                 </Button>
@@ -1156,18 +1156,23 @@ function NewJob({ onCreated, defaultOutputsDir }: {
             </Tooltip>
             <Tooltip title="開啟本機原生資料夾選擇對話框">
               <span>
-                <Button size="small" onClick={pickOutputDir} disabled={pickingOutputDir} sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}>
+                <Button size="small" onClick={pickOutputDir} disabled={pickingOutputDir} sx={{ minWidth: 'auto' }}>
                   {pickingOutputDir ? '選擇中…' : '選擇…'}
                 </Button>
               </span>
             </Tooltip>
             {outputDir && (
-              <Button size="small" onClick={() => setOutputDir('')} sx={{ whiteSpace: 'nowrap', minWidth: 'auto' }}>清除</Button>
+              <Button size="small" onClick={() => setOutputDir('')} sx={{ minWidth: 'auto' }}>清除</Button>
             )}
           </Stack>
         </Stack>
 
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ mb: 1.5 }}>
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          spacing={2}
+          useFlexGap
+          sx={{ mb: 1.5, flexWrap: 'wrap', alignItems: { sm: 'center' } }}
+        >
           <FormControl size="small" sx={{ minWidth: 180 }}>
             <InputLabel>語言</InputLabel>
             <Select label="語言" value={language} onChange={(e) => setLanguage(e.target.value)}>
@@ -1197,7 +1202,6 @@ function NewJob({ onCreated, defaultOutputsDir }: {
               size="small"
               startIcon={<StorageIcon />}
               onClick={() => setManageOpen(true)}
-              sx={{ whiteSpace: 'nowrap', flexShrink: 0 }}
             >
               模型管理
             </Button>
@@ -1205,6 +1209,7 @@ function NewJob({ onCreated, defaultOutputsDir }: {
           <FormControlLabel
             control={<Checkbox checked={vad} onChange={(e) => setVad(e.target.checked)} />}
             label="VAD（過濾靜音）"
+            sx={{ whiteSpace: 'nowrap' }}
           />
         </Stack>
 
@@ -1759,7 +1764,7 @@ function JobDetail({ jobId, onChange, onCancelPendingChange }: {
       {live && isActive && receiving && (
         <Card variant="outlined">
           <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, mb: 0.5 }}>
               <Typography variant="caption" color="text.secondary">
                 收音監測 · 進到 whisper 的音訊波形（最近 24 秒）
               </Typography>

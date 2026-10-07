@@ -108,8 +108,14 @@ export const theme = createTheme({
     MuiButton: {
       defaultProps: { disableElevation: true },
       styleOverrides: {
-        root: { borderRadius: 999, paddingInline: 20, minHeight: 40 },
+        // Labels never wrap and buttons never shrink: in a tight flex row the
+        // button keeps its natural width and the row has to make room (wrap,
+        // or shrink a text field) instead of squeezing the label onto 2 lines.
+        root: { borderRadius: 999, paddingInline: 20, minHeight: 40, whiteSpace: 'nowrap', flexShrink: 0 },
       },
+    },
+    MuiToggleButton: {
+      styleOverrides: { root: { whiteSpace: 'nowrap', flexShrink: 0 } },
     },
     MuiPaper: {
       styleOverrides: {
@@ -128,10 +134,10 @@ export const theme = createTheme({
       },
     },
     MuiChip: {
-      styleOverrides: { root: { fontWeight: 500 } },
+      styleOverrides: { root: { fontWeight: 500, flexShrink: 0 } },
     },
     MuiTab: {
-      styleOverrides: { root: { textTransform: 'none', fontWeight: 500 } },
+      styleOverrides: { root: { textTransform: 'none', fontWeight: 500, whiteSpace: 'nowrap' } },
     },
     MuiTextField: {
       defaultProps: { variant: 'outlined', size: 'small' },
